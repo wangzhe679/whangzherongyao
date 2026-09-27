@@ -64,6 +64,7 @@ pub async fn list_accounts(
 #[tauri::command]
 pub async fn add_account(
     app: tauri::AppHandle,
+    proxy_state: tauri::State<'_, crate::commands::proxy::ProxyServiceState>,
     _email: String,
     refresh_token: String,
 ) -> Result<Account, String> {
@@ -76,11 +77,11 @@ pub async fn add_account(
     // 自动刷新配额
     let _ = internal_refresh_account_quota(&app, &mut account).await;
 
-    // 重载账号池
-    let _ = crate::commands::proxy::reload_proxy_accounts(
-        app.state::<crate::commands::proxy::ProxyServiceState>(),
-    )
-    .await;
+    // 只加载刚添加的账号，避免批量 RT 导入时反复重载整个账号池
+    let instance_lock = proxy_state.instance.read().await;
+    if let Some(instance) = instance_lock.as_ref() {
+        let _ = instance.token_manager.reload_account(&account.id).await;
+    }
 
     Ok(account)
 }

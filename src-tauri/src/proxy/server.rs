@@ -1491,20 +1491,30 @@ async fn admin_add_account(
             )
         })?;
 
-    // [FIX #1166] 账号变动后立即重新加载 TokenManager
-    if let Err(e) = state.token_manager.load_accounts().await {
+    // 只加载刚添加的账号，避免批量 RT 导入时反复重载整个账号池
+    if let Err(e) = state.token_manager.reload_account(&account.id).await {
         logger::log_error(&format!(
-            "[API] Failed to reload accounts after adding: {}",
+            "[API] Failed to load added account into token manager: {}",
             e
         ));
     }
 
-    let current_id = state.account_service.get_current_id().map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse { error: e }),
-        )
-    })?;
+    let current_id = tokio::task::spawn_blocking(crate::modules::get_current_account_id)
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: "Account index task panicked".to_string(),
+                }),
+            )
+        })?
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: e }),
+            )
+        })?;
     Ok(Json(to_account_response(&account, &current_id)))
 }
 

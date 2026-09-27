@@ -43,8 +43,13 @@ impl AccountService {
         .with_oauth_client_key(token_res.oauth_client_key.clone());
 
         // 5. 持久化
-        let mut account =
-            modules::upsert_account(user_info.email.clone(), user_info.get_display_name(), token)?;
+        let account_email = user_info.email.clone();
+        let account_name = user_info.get_display_name();
+        let mut account = tokio::task::spawn_blocking(move || {
+            modules::upsert_account(account_email, account_name, token)
+        })
+        .await
+        .map_err(|_| "Account persistence task panicked".to_string())??;
 
         // 6. [NEW] 自动获取配额信息（用于刷新时间排序）
         let email_for_log = account.email.clone();
@@ -56,7 +61,13 @@ impl AccountService {
                     account.token.project_id = Some(pid);
                 }
                 // 保存更新后的账号信息
-                if let Err(e) = modules::account::save_account(&account) {
+                let account_to_save = account.clone();
+                let save_result = tokio::task::spawn_blocking(move || {
+                    modules::account::save_account(&account_to_save)
+                })
+                .await
+                .unwrap_or_else(|_| Err("Account save task panicked".to_string()));
+                if let Err(e) = save_result {
                     modules::logger::log_warn(&format!(
                         "[Service] Failed to save quota for {}: {}",
                         email_for_log, e

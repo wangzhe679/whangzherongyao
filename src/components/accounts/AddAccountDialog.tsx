@@ -16,12 +16,16 @@ interface AddAccountDialogProps {
 
 type Status = 'idle' | 'loading' | 'success' | 'error';
 
+const DEFAULT_RT_IMPORT_CONCURRENCY = 30;
+const MAX_RT_IMPORT_CONCURRENCY = 1000;
+
 function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
     const { t } = useTranslation();
     const fetchAccounts = useAccountStore(state => state.fetchAccounts);
     const [isOpen, setIsOpen] = useState(false);
     const [activeTab, setActiveTab] = useState<'oauth' | 'token' | 'import'>(isTauri() ? 'oauth' : 'token');
     const [refreshToken, setRefreshToken] = useState('');
+    const [rtImportConcurrency, setRtImportConcurrency] = useState(DEFAULT_RT_IMPORT_CONCURRENCY);
     const [oauthUrl, setOauthUrl] = useState('');
     const [oauthUrlCopied, setOauthUrlCopied] = useState(false);
     const [manualCode, setManualCode] = useState('');
@@ -239,19 +243,34 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
         let successCount = 0;
         let failCount = 0;
 
-        for (let i = 0; i < tokens.length; i++) {
-            const currentToken = tokens[i];
-            setMessage(t('accounts.add.token.batch_progress', { current: i + 1, total: tokens.length }));
+        let nextIndex = 0;
+        let completedCount = 0;
+        const concurrency = Math.min(Math.floor(rtImportConcurrency), MAX_RT_IMPORT_CONCURRENCY, tokens.length);
+        const addToken = tokens.length === 1
+            ? (token: string) => onAdd("", token)
+            : (token: string) => invoke('add_account', { email: "", refreshToken: token });
 
-            try {
-                await onAdd("", currentToken);
-                successCount++;
-            } catch (error) {
-                console.error(`Failed to add token ${i + 1}:`, error);
-                failCount++;
+        const workers = Array.from({ length: concurrency }, async () => {
+            while (true) {
+                const index = nextIndex++;
+                if (index >= tokens.length) return;
+
+                try {
+                    await addToken(tokens[index]);
+                    successCount++;
+                } catch (error) {
+                    console.error(`Failed to add token ${index + 1}:`, error);
+                    failCount++;
+                } finally {
+                    completedCount++;
+                    setMessage(t('accounts.add.token.batch_progress', { current: completedCount, total: tokens.length }));
+                }
             }
-            // 稍微延迟一下,避免太快
-            await new Promise(r => setTimeout(r, 100));
+        });
+
+        await Promise.all(workers);
+        if (tokens.length > 1) {
+            await fetchAccounts();
         }
 
         // 4. 结果反馈
@@ -631,6 +650,19 @@ function AddAccountDialog({ onAdd, showText = true }: AddAccountDialogProps) {
                                     <div className="bg-gray-50 dark:bg-base-200 p-4 rounded-lg border border-gray-200 dark:border-base-300">
                                         <div className="flex justify-between items-center mb-2">
                                             <span className="text-sm font-medium text-gray-500 dark:text-gray-400">{t('accounts.add.token.label')}</span>
+                                            <label className="flex items-center gap-2 text-xs text-gray-500 dark:text-gray-400">
+                                                <span>RT 并发</span>
+                                                <input
+                                                    type="number"
+                                                    min={DEFAULT_RT_IMPORT_CONCURRENCY}
+                                                    max={MAX_RT_IMPORT_CONCURRENCY}
+                                                    step={1}
+                                                    value={rtImportConcurrency}
+                                                    onChange={(e) => setRtImportConcurrency(Math.min(MAX_RT_IMPORT_CONCURRENCY, Math.max(DEFAULT_RT_IMPORT_CONCURRENCY, Math.floor(Number(e.target.value) || DEFAULT_RT_IMPORT_CONCURRENCY))))}
+                                                    disabled={status === 'loading' || status === 'success'}
+                                                    className="input input-bordered input-xs w-20 text-center bg-white dark:bg-base-100"
+                                                />
+                                            </label>
                                         </div>
                                         <textarea
                                             className="textarea textarea-bordered w-full h-32 font-mono text-xs leading-relaxed focus:outline-none focus:border-blue-500 transition-colors bg-white dark:bg-base-100 text-gray-900 dark:text-base-content border-gray-300 dark:border-base-300 placeholder:text-gray-400"
