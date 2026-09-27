@@ -1,0 +1,118 @@
+name: Release Ubuntu Linux x64
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-package-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-linux:
+    name: Ubuntu 22.04 x64 packages
+    runs-on: ubuntu-22.04
+    timeout-minutes: 90
+    env:
+      CARGO_BUILD_JOBS: 2
+      APPIMAGE_EXTRACT_AND_RUN: '1'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake ninja-build clang libclang-dev \
+            libwebkit2gtk-4.1-dev libssl-dev libgtk-3-dev \
+            libayatana-appindicator3-dev librsvg2-dev patchelf \
+            libsoup-3.0-dev libjavascriptcoregtk-4.1-dev libnm-dev \
+            xdg-utils file curl wget
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: ubuntu-22.04-x64-release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install frontend dependencies
+        run: npm ci --legacy-peer-deps
+
+      - name: Build Linux release binary and Web UI
+        env:
+          ANTIGRAVITY_OAUTH_CLIENT_ID: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_ID }}
+          ANTIGRAVITY_OAUTH_CLIENT_SECRET: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_SECRET }}
+        run: |
+          test -n "$ANTIGRAVITY_OAUTH_CLIENT_ID" && test -n "$ANTIGRAVITY_OAUTH_CLIENT_SECRET" || { echo "Required OAuth build secrets are not configured"; exit 1; }
+          npm run tauri build -- --no-bundle --config '{"bundle":{"createUpdaterArtifacts":false}}'
+
+      - name: Package server binary and build information
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node -p "require('./package.json').version")"
+          short_sha="${GITHUB_SHA:0:8}"
+          folder="antigravity-tools-${version}-linux-x64-${short_sha}"
+          mkdir -p "packages/$folder"
+          cp src-tauri/target/release/antigravity-tools "packages/$folder/"
+          cp CUSTOM_MIGRATION.md VALIDATION.md LICENSE "packages/$folder/"
+          cp -r dist "packages/$folder/dist"
+          printf '#!/usr/bin/env bash\nset -euo pipefail\ncd -- "$(dirname -- "${BASH_SOURCE[0]}")"\nexport ABV_DIST_PATH="$PWD/dist"\nexec ./antigravity-tools --headless "$@"\n' > "packages/$folder/start.sh"
+          chmod +x "packages/$folder/start.sh"
+          printf 'Version: %s\nCommit: %s\nPlatform: Ubuntu 22.04+ x86_64\nHeadless: ./start.sh\nWeb UI: http://localhost:8045\nUbuntu runtime dependencies: sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates\nIdentity injection and live upstream verification remain incomplete; see VALIDATION.md.\n' \
+            "$version" "$GITHUB_SHA" > "packages/$folder/BUILD.txt"
+          tar -C packages -czf "packages/$folder.tar.gz" "$folder"
+          (cd packages && sha256sum *.tar.gz > SHA256SUMS.txt)
+          {
+            echo '## Ubuntu / Linux x64 download'
+            echo 'The Release contains the server .tar.gz with Web UI, start.sh and SHA256SUMS.txt.'
+            echo "Source commit: $GITHUB_SHA"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload downloadable Linux archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-tools-linux-x64-${{ github.run_number }}
+          path: |
+            packages/*.tar.gz
+            packages/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30
+          compression-level: 0
+
+  publish-release:
+    name: Publish Linux tar.gz
+    needs: build-linux
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: antigravity-tools-linux-x64-${{ github.run_number }}
+          path: packages
+      - name: Publish downloadable release
+        uses: ncipollo/release-action@v1
+        with:
+          tag: ${{ github.ref_name }}
+          name: Antigravity Tools ${{ github.ref_name }} - Ubuntu Linux x64
+          artifacts: packages/*.tar.gz,packages/SHA256SUMS.txt
+          artifactErrorsFailBuild: true
+          prerelease: true
+          makeLatest: false
+          body: |
+            Ubuntu 22.04+ / Linux x86_64 custom build based on official v4.8.4-beta.1.
+            Download the .tar.gz below: compiled executable, complete Web UI, start.sh, and validation notes are included.
+            Extract and run ./start.sh. Runtime dependencies are listed in BUILD.txt.
+            Identity injection and live upstream verification remain incomplete; see VALIDATION.md inside the archive.
