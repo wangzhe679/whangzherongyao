@@ -1,4 +1,4 @@
-name: Release Ubuntu Linux x64
+name: Release Linux Docker image
 
 on:
   push:
@@ -14,12 +14,11 @@ concurrency:
 
 jobs:
   build-linux:
-    name: Ubuntu 22.04 x64 packages
+    name: Linux amd64 Docker archive
     runs-on: ubuntu-22.04
     timeout-minutes: 90
     env:
       CARGO_BUILD_JOBS: 2
-      APPIMAGE_EXTRACT_AND_RUN: '1'
     steps:
       - uses: actions/checkout@v4
 
@@ -56,33 +55,57 @@ jobs:
           test -n "$ANTIGRAVITY_OAUTH_CLIENT_ID" && test -n "$ANTIGRAVITY_OAUTH_CLIENT_SECRET" || { echo "Required OAuth build secrets are not configured"; exit 1; }
           npm run tauri build -- --no-bundle --config '{"bundle":{"createUpdaterArtifacts":false}}'
 
-      - name: Package server binary and build information
+      - name: Build and verify Docker image, then export docker-load archive
         shell: bash
         run: |
-          set -euo pipefail
-          version="$(node -p "require('./package.json').version")"
-          short_sha="${GITHUB_SHA:0:8}"
-          folder="antigravity-tools-${version}-linux-x64-${short_sha}"
-          mkdir -p "packages/$folder"
-          cp src-tauri/target/release/antigravity-tools "packages/$folder/"
-          cp CUSTOM_MIGRATION.md VALIDATION.md LICENSE "packages/$folder/"
-          cp -r dist "packages/$folder/dist"
-          printf '#!/usr/bin/env bash\nset -euo pipefail\ncd -- "$(dirname -- "${BASH_SOURCE[0]}")"\nexport ABV_DIST_PATH="$PWD/dist"\nexec ./antigravity-tools --headless "$@"\n' > "packages/$folder/start.sh"
-          chmod +x "packages/$folder/start.sh"
-          printf 'Version: %s\nCommit: %s\nPlatform: Ubuntu 22.04+ x86_64\nHeadless: ./start.sh\nWeb UI: http://localhost:8045\nUbuntu runtime dependencies: sudo apt-get install libwebkit2gtk-4.1-0 libgtk-3-0 libayatana-appindicator3-1 librsvg2-2 ca-certificates\nIdentity injection and live upstream verification remain incomplete; see VALIDATION.md.\n' \
-            "$version" "$GITHUB_SHA" > "packages/$folder/BUILD.txt"
-          tar -C packages -czf "packages/$folder.tar.gz" "$folder"
-          (cd packages && sha256sum *.tar.gz > SHA256SUMS.txt)
+          set -Eeuo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            version="$GITHUB_REF_NAME"
+          else
+            version="v$(node -p "require('./package.json').version")-docker-$GITHUB_RUN_NUMBER"
+          fi
+          image="antigravity-manager:$version"
+          archive="antigravity-manager-$version.tar.gz"
+          mkdir -p image-context packages
+          cp src-tauri/target/release/antigravity-tools image-context/
+          cp -r dist image-context/dist
+          docker build --platform linux/amd64 -f docker/Dockerfile.release -t "$image" image-context
+          docker run --rm --entrypoint /bin/sh "$image" -ec '
+            test -x /app/antigravity-tools
+            test -s /app/dist/index.html
+            ldd /app/antigravity-tools > /tmp/libraries
+            cat /tmp/libraries
+            ! grep -q "not found" /tmp/libraries
+          '
+          test_name="antigravity-build-check-$GITHUB_RUN_ID"
+          trap 'docker rm -f "$test_name" >/dev/null 2>&1 || true' EXIT
+          docker run -d --name "$test_name" -p 127.0.0.1:18045:8045 \
+            -e ABV_API_KEY=ci-image-smoke-test -e ABV_WEB_PASSWORD=ci-image-smoke-test "$image"
+          ready=0
+          for attempt in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:18045/health >/dev/null; then ready=1; break; fi
+            sleep 2
+          done
+          if [ "$ready" -ne 1 ]; then docker logs --tail 100 "$test_name"; exit 1; fi
+          curl -fsS --max-time 10 http://127.0.0.1:18045/ -o /tmp/antigravity-index.html
+          grep -qi '<html' /tmp/antigravity-index.html
+          docker save "$image" | gzip -1 > "packages/$archive"
+          gzip -t "packages/$archive"
+          docker load -i "packages/$archive"
+          docker image inspect "$image" --format '{{.Os}}/{{.Architecture}}' | grep -qx 'linux/amd64'
+          (cd packages && sha256sum "$archive" > SHA256SUMS.txt)
           {
-            echo '## Ubuntu / Linux x64 download'
-            echo 'The Release contains the server .tar.gz with Web UI, start.sh and SHA256SUMS.txt.'
+            echo '## Docker image download (Linux amd64)'
+            echo "Image: $image"
+            echo "Import: docker load -i $archive"
+            echo 'The archive contains a Docker image, including the runtime dependencies, binary and Web UI.'
             echo "Source commit: $GITHUB_SHA"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Upload downloadable Linux archive
+      - name: Upload downloadable Docker image
         uses: actions/upload-artifact@v4
         with:
-          name: antigravity-tools-linux-x64-${{ github.run_number }}
+          name: antigravity-manager-docker-linux-amd64-${{ github.run_number }}
           path: |
             packages/*.tar.gz
             packages/SHA256SUMS.txt
@@ -91,7 +114,7 @@ jobs:
           compression-level: 0
 
   publish-release:
-    name: Publish Linux tar.gz
+    name: Publish Docker image tar.gz
     needs: build-linux
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
@@ -100,19 +123,26 @@ jobs:
     steps:
       - uses: actions/download-artifact@v4
         with:
-          name: antigravity-tools-linux-x64-${{ github.run_number }}
+          name: antigravity-manager-docker-linux-amd64-${{ github.run_number }}
           path: packages
       - name: Publish downloadable release
         uses: ncipollo/release-action@v1
         with:
           tag: ${{ github.ref_name }}
-          name: Antigravity Tools ${{ github.ref_name }} - Ubuntu Linux x64
+          name: Antigravity Manager ${{ github.ref_name }} - Docker Linux amd64
           artifacts: packages/*.tar.gz,packages/SHA256SUMS.txt
           artifactErrorsFailBuild: true
           prerelease: true
           makeLatest: false
           body: |
-            Ubuntu 22.04+ / Linux x86_64 custom build based on official v4.8.4-beta.1.
-            Download the .tar.gz below: compiled executable, complete Web UI, start.sh, and validation notes are included.
-            Extract and run ./start.sh. Runtime dependencies are listed in BUILD.txt.
-            Identity injection and live upstream verification remain incomplete; see VALIDATION.md inside the archive.
+            Linux amd64 Docker image based on official v4.8.4-beta.1 with the custom changes.
+            This .tar.gz is created by docker save | gzip and can be imported directly with docker load.
+
+            Download antigravity-manager-${{ github.ref_name }}.tar.gz, then run:
+            docker load -i antigravity-manager-${{ github.ref_name }}.tar.gz
+
+            Image name: antigravity-manager:${{ github.ref_name }}
+            Binary: /app/antigravity-tools; Web UI: /app/dist; data mount: /root/.antigravity_tools; port: 8045.
+            Existing docker run environment variables and the persistent data mount can be retained.
+            The workflow checks runtime libraries, container health, Web UI availability and docker load before publishing.
+            Identity injection and real upstream model verification remain incomplete.

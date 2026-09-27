@@ -1,0 +1,19 @@
+# Runtime image for the binary compiled on the Ubuntu 22.04 Actions runner.
+FROM ubuntu:22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl libssl3 libsqlite3-0 libgtk-3-0 \
+    libwebkit2gtk-4.1-0 libayatana-appindicator3-1 librsvg2-2 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY antigravity-tools /app/antigravity-tools
+COPY dist /app/dist
+RUN chmod +x /app/antigravity-tools
+
+ENV ABV_DIST_PATH=/app/dist RUST_LOG=info PORT=8045
+EXPOSE 8045
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:8045/health || exit 1
+ENTRYPOINT ["/app/antigravity-tools"]
+CMD ["--headless"]

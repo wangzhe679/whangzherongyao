@@ -88,4 +88,4 @@ gemini-3.1-flash-lite
 
 ## Linux 发布构建
 
-向 `wangzhe679/whangzherongyao` 推送 `v*` tag 会触发 Linux x64 Release，产物为包含程序、Web UI 和 `start.sh` 的 `.tar.gz`。官方 OAuth 客户端常量改由构建环境 `ANTIGRAVITY_OAUTH_CLIENT_ID`、`ANTIGRAVITY_OAUTH_CLIENT_SECRET` 注入；GitHub Actions 使用同名加密 Secrets。本地编译也需设置这两个环境变量。发布仓库使用清理过历史的源码快照，原对比基线和迁移历史保留在本地，不上传旧提交中的明文 OAuth 配置。
+向 `wangzhe679/whangzherongyao` 推送 `v*` tag 会触发 Linux amd64 Docker Release。产物 `antigravity-manager-<tag>.tar.gz` 由 `docker save | gzip` 导出，可直接执行 `docker load -i` 导入；镜像名为 `antigravity-manager:<tag>`。程序、前端和运行库均位于镜像中，保留 `/app/antigravity-tools`、`/app/dist`、`/root/.antigravity_tools` 数据挂载及 8045 端口。旧 `fixed.1` 的程序文件包不是 Docker 镜像，不可用于 `docker load`。官方 OAuth 客户端常量改由构建环境 `ANTIGRAVITY_OAUTH_CLIENT_ID`、`ANTIGRAVITY_OAUTH_CLIENT_SECRET` 注入；GitHub Actions 使用同名加密 Secrets。本地编译也需设置这两个环境变量。发布仓库使用清理过历史的源码快照，原对比基线和迁移历史保留在本地，不上传旧提交中的明文 OAuth 配置。
