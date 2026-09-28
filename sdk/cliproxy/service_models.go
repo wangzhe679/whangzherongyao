@@ -102,6 +102,10 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 	case "antigravity":
 		models = registry.GetAntigravityModels()
 		models = applyExcludedModels(models, excluded)
+		// Removing the upstream also removes its built-in alias. Reapply the
+		// exclusions so an explicitly excluded alias stays excluded as well.
+		models = registry.WithAntigravityReasoningAlias(models)
+		models = applyExcludedModels(models, excluded)
 	case "claude":
 		models = registry.GetClaudeModels()
 		if entry := s.resolveConfigClaudeKey(a); entry != nil {

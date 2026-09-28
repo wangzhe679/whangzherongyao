@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/thinking"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -42,7 +41,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if opts.Alt == "responses/compact" || helps.HasResponsesCompactionTrigger(req.Payload) || helps.HasResponsesCompactionTrigger(opts.OriginalRequest) {
 		return e.executeCompaction(ctx, auth, req, opts)
 	}
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := helps.AntigravityUpstreamModel(req.Model)
 	if !antigravityCoolingDisabled(auth, e.cfg) {
 		if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
 			return resp, homeKVUnavailableStatusErr(errCooldown)
@@ -93,7 +92,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, err = helps.AntigravityAnswerOnlyRequest(from.String(), baseModel, translated)
+	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated)
 	if err != nil {
 		return resp, err
 	}
@@ -204,7 +203,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		converted = helps.EnsureResponsesUsageDetails(converted)
 	}
-	if from.String() == "claude" && strings.HasPrefix(baseModel, "claude-") || from.String() == "gemini" && strings.HasPrefix(baseModel, "gemini-") {
+	if !helps.AntigravityVisibleThinkingModel(req.Model) && (from.String() == "claude" && strings.HasPrefix(baseModel, "claude-") || from.String() == "gemini" && strings.HasPrefix(baseModel, "gemini-")) {
 		converted = helps.AntigravityAnswerOnlyResponse(responseFormat.String(), converted)
 	}
 	resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}
@@ -213,7 +212,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 }
 
 func (e *AntigravityExecutor) executeCompaction(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := helps.AntigravityUpstreamModel(req.Model)
 	payload := req.Payload
 	if len(payload) == 0 && len(opts.OriginalRequest) > 0 {
 		payload = opts.OriginalRequest
@@ -265,7 +264,7 @@ func (e *AntigravityExecutor) executeCompaction(ctx context.Context, auth *clipr
 
 // executeClaudeNonStream performs a claude non-streaming request to the Antigravity API.
 func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	baseModel := helps.AntigravityUpstreamModel(req.Model)
 	if !antigravityCoolingDisabled(auth, e.cfg) {
 		if inCooldown, remaining, errCooldown := antigravityIsInShortCooldownRequired(ctx, auth, baseModel, time.Now()); errCooldown != nil {
 			return resp, homeKVUnavailableStatusErr(errCooldown)
@@ -311,7 +310,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, err = helps.AntigravityAnswerOnlyRequest(from.String(), baseModel, translated)
+	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated)
 	if err != nil {
 		return resp, err
 	}
@@ -484,7 +483,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	if responseFormat == sdktranslator.FormatOpenAIResponse {
 		converted = helps.EnsureResponsesUsageDetails(converted)
 	}
-	if from.String() == "claude" && strings.HasPrefix(baseModel, "claude-") || from.String() == "gemini" && strings.HasPrefix(baseModel, "gemini-") {
+	if !helps.AntigravityVisibleThinkingModel(req.Model) && (from.String() == "claude" && strings.HasPrefix(baseModel, "claude-") || from.String() == "gemini" && strings.HasPrefix(baseModel, "gemini-")) {
 		converted = helps.AntigravityAnswerOnlyResponse(responseFormat.String(), converted)
 	}
 	resp = cliproxyexecutor.Response{Payload: converted, Headers: httpResp.Header.Clone()}

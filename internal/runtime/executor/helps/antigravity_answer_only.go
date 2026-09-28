@@ -155,7 +155,7 @@ func (s *antigravityAnswerStream) filter(payload []byte) []byte {
 // keep an accepted HTTP stream alive while an upstream that cannot disable
 // reasoning is silent. They never fabricate completion or impose a read timeout.
 func AntigravityAnswerOnlyStream(ctx context.Context, source, model, format string, input <-chan cliproxyexecutor.StreamChunk) <-chan cliproxyexecutor.StreamChunk {
-	if !antigravityToolsRoute(source, model) || (format != "claude" && format != "gemini") {
+	if AntigravityVisibleThinkingModel(model) || !antigravityToolsRoute(source, model) || (format != "claude" && format != "gemini") {
 		return input
 	}
 	out := make(chan cliproxyexecutor.StreamChunk)

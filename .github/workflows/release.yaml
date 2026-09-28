@@ -19,7 +19,7 @@ jobs:
           cache: true
       - name: Test Antigravity compatibility
         run: |
-          go test ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/translator/antigravity/... ./internal/signature -run 'Antigravity|Signature' -count=1
+          go test ./internal/registry ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/translator/antigravity/... ./internal/signature ./sdk/cliproxy -run 'Antigravity|Signature' -count=1
           go test -race ./internal/api/handlers/management -run TestCustom -count=1
           go test ./sdk/api/handlers/... -run 'Error|Stream' -count=1
       - name: Build Linux amd64 with GLIBC 2.17 baseline
@@ -73,4 +73,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/CLIProxyAPI_*.tar.gz dist/checksums.txt \
             --title "CLIProxyAPI ${GITHUB_REF_NAME#v} - Linux amd64" \
-            --notes-file .github/custom11-release.md --prerelease
+            --notes-file .github/custom12-release.md --prerelease
