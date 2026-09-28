@@ -73,4 +73,4 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" dist/CLIProxyAPI_*.tar.gz dist/checksums.txt \
             --title "CLIProxyAPI ${GITHUB_REF_NAME#v} - Linux amd64" \
-            --notes-file .github/custom12-release.md --prerelease
+            --notes-file .github/custom13-release.md --prerelease

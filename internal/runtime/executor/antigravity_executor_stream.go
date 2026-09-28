@@ -91,7 +91,7 @@ func (e *AntigravityExecutor) ExecuteStream(ctx context.Context, auth *cliproxya
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated)
+	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated, req.Payload)
 	if err != nil {
 		return nil, err
 	}

@@ -92,7 +92,7 @@ func (e *AntigravityExecutor) Execute(ctx context.Context, auth *cliproxyauth.Au
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated)
+	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated, req.Payload)
 	if err != nil {
 		return resp, err
 	}
@@ -310,7 +310,7 @@ func (e *AntigravityExecutor) executeClaudeNonStream(ctx context.Context, auth *
 	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
 	requestPath := helps.PayloadRequestPath(opts)
 	translated = helps.ApplyPayloadConfigWithRequest(e.cfg, baseModel, "antigravity", from.String(), "request", translated, originalTranslated, requestedModel, requestPath, opts.Headers)
-	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated)
+	translated, err = helps.AntigravityModelRequest(from.String(), req.Model, translated, req.Payload)
 	if err != nil {
 		return resp, err
 	}
