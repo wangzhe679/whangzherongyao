@@ -1,0 +1,76 @@
+name: CPA Linux amd64 release
+
+on:
+  push:
+    tags:
+      - 'v7.3.2-custom*'
+
+permissions:
+  contents: write
+
+jobs:
+  linux-amd64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.4'
+          cache: true
+      - name: Test Antigravity compatibility
+        run: |
+          go test ./internal/runtime/executor/helps ./internal/runtime/executor ./internal/translator/antigravity/... ./internal/signature -run 'Antigravity|Signature' -count=1
+          go test -race ./internal/api/handlers/management -run TestCustom -count=1
+          go test ./sdk/api/handlers/... -run 'Error|Stream' -count=1
+      - name: Build Linux amd64 with GLIBC 2.17 baseline
+        env:
+          GO_VERSION: '1.26.4'
+          ANTIGRAVITY_OAUTH_CLIENT_ID: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_ID }}
+          ANTIGRAVITY_OAUTH_CLIENT_SECRET: ${{ secrets.ANTIGRAVITY_OAUTH_CLIENT_SECRET }}
+        run: |
+          set -euo pipefail
+          test -n "$ANTIGRAVITY_OAUTH_CLIENT_ID" && test -n "$ANTIGRAVITY_OAUTH_CLIENT_SECRET"
+          export RELEASE_VERSION="${GITHUB_REF_NAME#v}"
+          export COMMIT="$(git rev-parse --short HEAD)"
+          export BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          mkdir -p dist/archive
+          docker run --rm -v "$PWD:/src" -w /src \
+            -e GO_VERSION -e RELEASE_VERSION -e COMMIT -e BUILD_DATE \
+            -e ANTIGRAVITY_OAUTH_CLIENT_ID -e ANTIGRAVITY_OAUTH_CLIENT_SECRET \
+            quay.io/pypa/manylinux2014_x86_64 \
+            bash -euo pipefail -c '
+              curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-amd64.tar.gz" -o /tmp/go.tar.gz
+              tar -C /usr/local -xzf /tmp/go.tar.gz
+              export PATH="/usr/local/go/bin:${PATH}"
+              flags="-s -w -X main.Version=${RELEASE_VERSION} -X main.Commit=${COMMIT} -X main.BuildDate=${BUILD_DATE}"
+              prefix=github.com/router-for-me/CLIProxyAPI/v7
+              flags+=" -X ${prefix}/internal/auth/antigravity.ClientID=${ANTIGRAVITY_OAUTH_CLIENT_ID} -X ${prefix}/internal/auth/antigravity.ClientSecret=${ANTIGRAVITY_OAUTH_CLIENT_SECRET}"
+              flags+=" -X ${prefix}/internal/runtime/executor.antigravityClientID=${ANTIGRAVITY_OAUTH_CLIENT_ID} -X ${prefix}/internal/runtime/executor.antigravityClientSecret=${ANTIGRAVITY_OAUTH_CLIENT_SECRET}"
+              flags+=" -X ${prefix}/internal/api/handlers/management.antigravityOAuthClientID=${ANTIGRAVITY_OAUTH_CLIENT_ID} -X ${prefix}/internal/api/handlers/management.antigravityOAuthClientSecret=${ANTIGRAVITY_OAUTH_CLIENT_SECRET}"
+              CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -buildvcs=false \
+                -ldflags="$flags" \
+                -o dist/archive/cli-proxy-api ./cmd/server
+              max_glibc="$(readelf --version-info dist/archive/cli-proxy-api | sed -n "s/.*Name: GLIBC_\([0-9.]*\).*/\1/p" | sort -V | tail -n 1)"
+              if [[ -n "$max_glibc" && "$(printf "2.17\n%s\n" "$max_glibc" | sort -V | tail -n 1)" != "2.17" ]]; then
+                echo "Unexpected GLIBC requirement: $max_glibc"
+                exit 1
+              fi
+            '
+          cp LICENSE README.md README_CN.md config.example.yaml dist/archive/
+          tar -C dist/archive -czf "dist/CLIProxyAPI_${RELEASE_VERSION}_linux_amd64.tar.gz" cli-proxy-api LICENSE README.md README_CN.md config.example.yaml
+          cd dist
+          sha256sum CLIProxyAPI_*.tar.gz > checksums.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: CLIProxyAPI-linux-amd64
+          path: |
+            dist/CLIProxyAPI_*.tar.gz
+            dist/checksums.txt
+          if-no-files-found: error
+      - name: Publish release archive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/CLIProxyAPI_*.tar.gz dist/checksums.txt \
+            --title "CLIProxyAPI ${GITHUB_REF_NAME#v} - Linux amd64" \
+            --notes-file .github/custom11-release.md --prerelease
