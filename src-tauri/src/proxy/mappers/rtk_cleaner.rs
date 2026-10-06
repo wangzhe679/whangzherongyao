@@ -5,6 +5,7 @@
 
 use once_cell::sync::Lazy;
 use regex::Regex;
+use std::borrow::Cow;
 
 // Lazy static regular expressions to optimize processing
 static ANSI_RE: Lazy<Regex> = Lazy::new(|| Regex::new(r"\x1B\[[0-9;?]*[a-zA-Z]").unwrap());
@@ -37,7 +38,8 @@ impl RtkCleaner {
         let grouped_lines = Self::group_similar_lines(&deduped_lines);
 
         // 5. Smart Truncate: Keep head/tail, but preserve error/failure rows from the middle
-        Self::smart_truncate(&grouped_lines, max_lines)
+        let grouped_refs: Vec<&str> = grouped_lines.iter().map(|line| line.as_ref()).collect();
+        Self::smart_truncate(&grouped_refs, max_lines)
     }
 
     /// Strip terminal color and control sequences
@@ -66,9 +68,9 @@ impl RtkCleaner {
 
     /// Group similar consecutive lines by replacing digit clusters with a placeholder
     /// and collapsing runs of identical "skeletons".
-    pub fn group_similar_lines<'a>(lines: &[&'a str]) -> Vec<&'a str> {
+    pub fn group_similar_lines<'a>(lines: &[&'a str]) -> Vec<Cow<'a, str>> {
         if lines.len() < 3 {
-            return lines.to_vec();
+            return lines.iter().map(|line| Cow::Borrowed(*line)).collect();
         }
 
         let mut result = Vec::new();
@@ -79,7 +81,7 @@ impl RtkCleaner {
             let current_trimmed = current.trim();
 
             if current_trimmed.is_empty() || current_trimmed.len() < 5 {
-                result.push(current);
+                result.push(Cow::Borrowed(current));
                 index += 1;
                 continue;
             }
@@ -112,20 +114,18 @@ impl RtkCleaner {
             if run_len >= 3 {
                 // We have a run of 3 or more similar lines. Keep the first line,
                 // add a placeholder indicating collapsed lines, and keep the last line of the run.
-                result.push(lines[index]);
+                result.push(Cow::Borrowed(lines[index]));
 
-                // Construct placeholder string
-                // We use static allocation for the placeholder to avoid lifetime issues
-                let collapsed_msg = Box::leak(
-                    format!("... [Collapsed {} similar lines] ...", run_len - 2).into_boxed_str(),
-                );
-                result.push(collapsed_msg);
+                result.push(Cow::Owned(format!(
+                    "... [Collapsed {} similar lines] ...",
+                    run_len - 2
+                )));
 
-                result.push(lines[run_end - 1]);
+                result.push(Cow::Borrowed(lines[run_end - 1]));
             } else {
                 // Copy the elements as-is
                 for i in index..run_end {
-                    result.push(lines[i]);
+                    result.push(Cow::Borrowed(lines[i]));
                 }
             }
 
@@ -230,6 +230,19 @@ mod tests {
         assert!(result[1].contains("Collapsed 2 similar lines"));
         assert_eq!(result[2], "[ 40%] Building index.ts");
         assert_eq!(result[3], "Finished building.");
+    }
+
+    #[test]
+    fn memory_reclamation_rtk_collapsed_text_has_owned_lifetime() {
+        let input = "Progress 10\nProgress 20\nProgress 30\nDone".to_string();
+        let lines: Vec<_> = input.lines().collect();
+        let grouped = RtkCleaner::group_similar_lines(&lines);
+        assert!(matches!(grouped[0], Cow::Borrowed(_)));
+        assert!(matches!(grouped[1], Cow::Owned(_)));
+        assert_eq!(
+            RtkCleaner::clean(&input, 10),
+            "Progress 10\n... [Collapsed 1 similar lines] ...\nProgress 30\nDone"
+        );
     }
 
     #[test]

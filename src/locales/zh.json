@@ -1058,7 +1058,7 @@
         "days_unit": "天",
         "claude_budget_title": "Claude 思考模型预算 (Tokens)",
         "claude_budget_desc": "客户端调用思考模型（如 claude-3-7-sonnet-thinking）时的核心 Token 预算（填 -1 则由官方自适应）",
-        "claude_budget_current": "推荐默认值: 16,384 Tokens (兼顾思考深度与响应速率)",
+        "claude_budget_current": "默认值：1,024 Tokens；[思考] Opus 请求始终使用正数预算",
         "claude_hide_advanced": "收起客户端 Effort 档位映射",
         "claude_show_advanced": "展开高级设置：客户端 Effort 档位映射 (low / medium / high)",
         "claude_effort_mapping_desc": "当部分商业客户端（如 Cline, Roo 等）在请求头或参数中附带 reasoning_effort 时，按以下预算映射：",

@@ -24,6 +24,7 @@ static CLAUDE_TO_GEMINI: Lazy<HashMap<&'static str, &'static str>> = Lazy::new(|
     m.insert("claude-sonnet-4-6", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-6-thinking", "claude-sonnet-4-6-thinking");
     m.insert("claude-opus-4-6", "claude-opus-4-6-thinking");
+    m.insert("[思考]claude-opus-4-6", "claude-opus-4-6-thinking");
     m.insert("claude-opus-4-6-thinking", "claude-opus-4-6-thinking");
     m.insert("claude-sonnet-4-5", "claude-sonnet-4-6");
     m.insert("claude-sonnet-4-5-thinking", "claude-sonnet-4-6-thinking");
@@ -147,6 +148,7 @@ pub fn get_supported_models() -> Vec<String> {
         "claude-sonnet-4-6",
         "claude-sonnet-4-6-thinking",
         "claude-opus-4-6",
+        "[思考]claude-opus-4-6",
         "claude-opus-4-6-thinking",
         "claude-sonnet-4-5",
         "claude-sonnet-4-5-thinking",

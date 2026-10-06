@@ -36,6 +36,7 @@ pub fn create_claude_sse_stream<S, E>(
     message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
     client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
     registered_tool_names: Vec<String>,   // [FIX #MCP] Tool names for fuzzy matching
+    show_thoughts: bool,
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -47,6 +48,7 @@ where
 
     Box::pin(stream! {
         let mut state = StreamingState::new();
+        state.show_thoughts = show_thoughts;
         state.session_id = session_id; // Set session ID for signature caching
         state.message_count = message_count; // [NEW v4.0.0] Set message count
         state.scaling_enabled = scaling_enabled; // Set scaling enabled flag
@@ -593,6 +595,7 @@ mod tests {
             1,          // message_count
             None,       // client_adapter
             Vec::new(), // registered_tool_names
+            true,
         );
 
         // 3. 收集输出

@@ -1,4 +1,5 @@
 import { Account, LiveLimitStatus } from '../types/account';
+import { independentModelKey } from './independentModels';
 
 export function getLiveLimitForModel(
     account: Account,
@@ -7,9 +8,13 @@ export function getLiveLimitForModel(
 ): LiveLimitStatus | undefined {
     if (!account.live_limited_models) return undefined;
     
-    const key = modelId?.startsWith('claude') ? 'claude' : modelId;
+    const key = modelId ? independentModelKey(modelId) : undefined;
     if (key && account.live_limited_models[key]) {
         return account.live_limited_models[key];
+    }
+    // Legacy Claude locks remain visible until their original deadline expires.
+    if (key?.startsWith('claude') && account.live_limited_models.claude) {
+        return account.live_limited_models.claude;
     }
     
     if (!modelId && protectedKey && account.live_limited_models[protectedKey]) {

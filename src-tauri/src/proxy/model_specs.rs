@@ -458,7 +458,7 @@ pub fn resolve_custom_budget(
             } else if tb_config.claude_high != 0 {
                 tb_config.claude_high
             } else {
-                16000
+                crate::proxy::pipeline::thinking_policy::DEFAULT_CLAUDE_THINKING_BUDGET as i32
             };
             if main_budget > 0 {
                 Some(main_budget as i64)

@@ -4915,7 +4915,12 @@ async fn admin_strict_pool_status(
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
     let page = query.get("page").and_then(|v| v.parse().ok()).unwrap_or(0);
-    match crate::commands::pool::pool_status(state.token_manager, page).await {
+    let include_details = query
+        .get("includeDetails")
+        .or_else(|| query.get("include_details"))
+        .and_then(|v| v.parse::<bool>().ok())
+        .unwrap_or(true);
+    match crate::commands::pool::pool_status(state.token_manager, page, include_details).await {
         Ok(value) => Json(value).into_response(),
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,

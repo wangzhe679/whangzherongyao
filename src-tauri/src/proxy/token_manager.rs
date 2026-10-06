@@ -245,12 +245,29 @@ impl TokenManager {
     }
 
     pub fn strict_pool_status(&self, page: usize) -> serde_json::Value {
-        use crate::proxy::model_locks::{model_key, INDEPENDENT_MODELS};
+        self.strict_pool_status_with_details(page, true)
+    }
+
+    pub fn strict_pool_status_summary(&self) -> serde_json::Value {
+        self.strict_pool_status_with_details(0, false)
+    }
+
+    fn strict_pool_status_with_details(
+        &self,
+        page: usize,
+        include_details: bool,
+    ) -> serde_json::Value {
+        use crate::proxy::model_locks::INDEPENDENT_MODELS;
         let now = chrono::Utc::now().timestamp();
-        let locks = self.rate_limit_tracker.strict.snapshot(now);
+        let lock_summary = self.rate_limit_tracker.strict.active_summary(now);
+        let locks = include_details.then(|| self.rate_limit_tracker.strict.snapshot(now));
         let mut models: Vec<serde_json::Value> = INDEPENDENT_MODELS
             .iter()
-            .map(|m| serde_json::json!({"model":m,"loaded":0,"available":0,"locked":0}))
+            .enumerate()
+            .map(|(i, m)| {
+                serde_json::json!({"model":m,"loaded":0,"available":0,"locked":0,
+                "lock_stats":lock_summary.models[i]})
+            })
             .collect();
         let mut available_count = 0usize;
         for entry in self.tokens.iter() {
@@ -258,15 +275,14 @@ impl TokenManager {
                 && (!entry.access_token.is_empty() || !entry.refresh_token.is_empty());
             let mut any = false;
             for (i, model) in INDEPENDENT_MODELS.iter().enumerate() {
-                let key = model_key(model);
-                if !entry.model_quotas.contains_key(&key) {
+                if !entry.model_quotas.contains_key(*model) {
                     continue;
                 }
                 let loaded = models[i]["loaded"].as_u64().unwrap_or(0) + 1;
                 models[i]["loaded"] = loaded.into();
                 let locked = self
                     .rate_limit_tracker
-                    .is_rate_limited(&entry.account_id, Some(&key));
+                    .is_rate_limited(&entry.account_id, Some(model));
                 let field = if locked {
                     "locked"
                 } else if ready {
@@ -289,10 +305,15 @@ impl TokenManager {
                 available_count += 1;
             }
         }
-        let mut ids: Vec<_> = locks.keys().cloned().collect();
+        let (total, model_count) = locks
+            .as_ref()
+            .map(|locks| (locks.len(), locks.values().map(|v| v.len()).sum()))
+            .unwrap_or((lock_summary.account_count, lock_summary.model_count));
+        let mut ids: Vec<_> = locks
+            .as_ref()
+            .map(|locks| locks.keys().cloned().collect())
+            .unwrap_or_default();
         ids.sort();
-        let total = ids.len();
-        let model_count: usize = locks.values().map(|v| v.len()).sum();
         let rows: Vec<_> = ids
             .into_iter()
             .skip(page.saturating_mul(100))
@@ -320,7 +341,7 @@ impl TokenManager {
                             .unwrap_or_default()
                     });
                 serde_json::json!({"account_id":id,"email":email,"loaded":token.is_some(),
-                "quotas":quotas,"locks":locks.get(&id)})
+                "quotas":quotas,"locks":locks.as_ref().and_then(|locks| locks.get(&id))})
             })
             .collect();
         serde_json::json!({"loaded_count":self.tokens.len(),"available_count":available_count,"models":models,
@@ -852,12 +873,24 @@ impl TokenManager {
                     model_quotas.insert(crate::proxy::model_locks::model_key(name), pct as i32);
                     if let Some(prefix) = name.strip_suffix("-tiered") {
                         for level in ["high", "medium", "low"] {
-                            model_quotas.insert(format!("{}-{}", prefix, level), pct as i32);
+                            model_quotas.insert(
+                                crate::proxy::model_locks::model_key(&format!(
+                                    "{}-{}",
+                                    prefix, level
+                                )),
+                                pct as i32,
+                            );
                         }
                     }
                     if crate::proxy::model_specs::is_bare_gemini_v36_or_above_flash(name) {
                         for level in ["high", "medium", "low", "tiered"] {
-                            model_quotas.insert(format!("{}-{}", name, level), pct as i32);
+                            model_quotas.insert(
+                                crate::proxy::model_locks::model_key(&format!(
+                                    "{}-{}",
+                                    name, level
+                                )),
+                                pct as i32,
+                            );
                         }
                     }
                     if name.starts_with("gemini-")
@@ -900,20 +933,8 @@ impl TokenManager {
                 ) {
                     continue;
                 }
-                let (Ok(until_seconds), Ok(detected_at_seconds)) = (
-                    u64::try_from(status.until),
-                    u64::try_from(status.detected_at),
-                ) else {
-                    continue;
-                };
-                self.rate_limit_tracker.restore_persisted_long_limit(
-                    &account_id,
-                    std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(until_seconds),
-                    std::time::SystemTime::UNIX_EPOCH
-                        + std::time::Duration::from_secs(detected_at_seconds),
-                    model_key,
-                );
+                self.rate_limit_tracker
+                    .restore_live_limit_status(&account_id, model_key, &status);
             }
         }
 
@@ -5176,7 +5197,7 @@ mod tests {
     fn strict_balance_bounds_large_pool_preserves_sticky_and_excludes_locked_models() {
         let dir = tempfile::tempdir().unwrap();
         let manager = TokenManager::new(dir.path().to_owned());
-        let model = "gemini-3.8-flash-high";
+        let model = "gemini-3.8-flash-tiered";
         for index in 0..10_000 {
             let id = format!("account-{index:05}");
             let mut token = create_test_token(&id, Some("PRO"), 1.0, None, Some(100));
@@ -5210,6 +5231,72 @@ mod tests {
                 .get_remaining_wait("account-09999", Some("gemini-3.7-flash-high")),
             0
         );
+    }
+
+    #[test]
+    fn strict_summary_keeps_model_availability_without_materializing_details() {
+        use crate::proxy::model_locks::INDEPENDENT_MODELS;
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TokenManager::new(dir.path().to_owned());
+        let mut first = create_test_token("first", Some("PRO"), 1.0, None, Some(100));
+        first.model_quotas = INDEPENDENT_MODELS
+            .iter()
+            .map(|m| (m.to_string(), 100))
+            .collect();
+        let mut second = create_test_token("second", Some("PRO"), 1.0, None, Some(100));
+        second.model_quotas.insert("claude-sonnet-4-6".into(), 40);
+        manager.tokens.insert("first".into(), first);
+        manager.tokens.insert("second".into(), second);
+        let now = chrono::Utc::now().timestamp();
+        manager.rate_limit_tracker.strict.record(
+            "first",
+            "claude-opus-4-6",
+            429,
+            "quota",
+            Some(now + 600),
+            true,
+            now,
+        );
+        manager.rate_limit_tracker.strict.record(
+            "first",
+            "gemini-3.6-flash-tiered",
+            503,
+            "busy",
+            None,
+            false,
+            now,
+        );
+        let summary = manager.strict_pool_status_summary();
+        assert_eq!(summary["loaded_count"], 2);
+        assert_eq!(summary["available_count"], 2);
+        assert_eq!(summary["locked_account_count"], 1);
+        assert_eq!(summary["locked_model_count"], 3);
+        assert_eq!(summary["locked_accounts"], serde_json::json!([]));
+        let models = summary["models"].as_array().unwrap();
+        assert_eq!(models.len(), 7);
+        assert_eq!(models[0]["model"], "claude-sonnet-4-6");
+        assert_eq!(models[0]["loaded"], 2);
+        assert_eq!(models[0]["available"], 1);
+        assert_eq!(models[0]["locked"], 1);
+        assert_eq!(models[0]["lock_stats"]["true_429"], 1);
+        assert_eq!(models[0]["lock_stats"]["short_locks"], 0);
+        assert_eq!(models[1]["model"], "claude-opus-4-6-thinking");
+        assert_eq!(models[1]["loaded"], 1);
+        assert_eq!(models[1]["available"], 0);
+        assert_eq!(models[1]["locked"], 1);
+        assert_eq!(models[2]["lock_stats"]["short_locks"], 1);
+        assert_eq!(models[3]["available"], 1);
+        let details = manager.strict_pool_status(0);
+        assert_eq!(details["locked_accounts"].as_array().unwrap().len(), 1);
+        for field in [
+            "models",
+            "loaded_count",
+            "available_count",
+            "locked_account_count",
+            "locked_model_count",
+        ] {
+            assert_eq!(summary[field], details[field]);
+        }
     }
 
     #[tokio::test]

@@ -90,6 +90,7 @@ pub(crate) mod prompt_log_tests {
             enabled: Arc::new(AtomicBool::new(true)),
             capture_health_logs: Arc::new(AtomicBool::new(false)),
             app_handle: None,
+            maintenance_task: None,
         };
         let log = sample_log("detail", 4096);
         let response = log.response_body.clone();
@@ -107,6 +108,24 @@ pub(crate) mod prompt_log_tests {
         monitor.set_enabled(false);
         monitor.log_request(sample_log("disabled", 4096)).await;
         assert!(crate::modules::proxy_db::get_log_detail("disabled").is_err());
+    }
+
+    #[tokio::test]
+    async fn memory_reclamation_monitor_drop_cancels_owned_timer() {
+        let task = tokio::spawn(std::future::pending::<()>());
+        let abort_handle = task.abort_handle();
+        let monitor = ProxyMonitor {
+            logs: RwLock::new(VecDeque::new()),
+            stats: RwLock::new(ProxyStats::default()),
+            max_logs: 1,
+            enabled: Arc::new(AtomicBool::new(false)),
+            capture_health_logs: Arc::new(AtomicBool::new(false)),
+            app_handle: None,
+            maintenance_task: Some(task),
+        };
+        drop(monitor);
+        tokio::task::yield_now().await;
+        assert!(abort_handle.is_finished());
     }
 }
 
@@ -244,6 +263,15 @@ pub struct ProxyMonitor {
     pub enabled: Arc<AtomicBool>,
     pub capture_health_logs: Arc<AtomicBool>,
     app_handle: Option<tauri::AppHandle>,
+    maintenance_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ProxyMonitor {
+    fn drop(&mut self) {
+        if let Some(task) = &self.maintenance_task {
+            task.abort();
+        }
+    }
 }
 
 impl ProxyMonitor {
@@ -288,11 +316,28 @@ impl ProxyMonitor {
             }
         });
 
-        tokio::spawn(async {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+        let maintenance_task = tokio::spawn(async {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await;
+            let mut last_retention = std::time::Instant::now();
             loop {
                 interval.tick().await;
+                // The monitor owns this one maintenance loop. Dropping it aborts
+                // the timer, so restarting the proxy cannot accumulate workers.
+                if let Err(error) = tokio::task::spawn_blocking(|| {
+                    crate::proxy::thinking_store::ThinkingStore::global().reclaim_idle_memory();
+                    crate::proxy::SignatureCache::global().evict_expired();
+                    crate::proxy::cache_manager::global_cache_manager().evict_expired();
+                })
+                .await
+                {
+                    tracing::error!("Proxy memory maintenance failed: {}", error);
+                }
+                if last_retention.elapsed() < std::time::Duration::from_secs(3600) {
+                    continue;
+                }
+                last_retention = std::time::Instant::now();
                 let thinking_days = crate::proxy::config::get_thinking_retention_days() as i64;
                 let retention = crate::modules::config::load_app_config()
                     .map(|config| config.proxy.log_retention)
@@ -343,6 +388,7 @@ impl ProxyMonitor {
             enabled: Arc::new(AtomicBool::new(false)), // Default to disabled
             capture_health_logs: Arc::new(AtomicBool::new(false)), // Default to false
             app_handle,
+            maintenance_task: Some(maintenance_task),
         }
     }
 

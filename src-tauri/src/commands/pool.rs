@@ -4,6 +4,7 @@ use crate::commands::proxy::ProxyServiceState;
 pub async fn get_strict_pool_status(
     state: tauri::State<'_, ProxyServiceState>,
     page: Option<usize>,
+    include_details: Option<bool>,
 ) -> Result<serde_json::Value, String> {
     let manager = {
         let instance = state.instance.read().await;
@@ -19,17 +20,22 @@ pub async fn get_strict_pool_status(
                 .clone()
         }
     };
-    pool_status(manager, page.unwrap_or(0)).await
+    pool_status(manager, page.unwrap_or(0), include_details.unwrap_or(true)).await
 }
 
 pub async fn pool_status(
     manager: std::sync::Arc<crate::proxy::TokenManager>,
     page: usize,
+    include_details: bool,
 ) -> Result<serde_json::Value, String> {
     manager.sync_pending_accounts().await;
     tokio::task::spawn_blocking(move || {
         manager.cleanup_strict_sessions();
-        let mut value = manager.strict_pool_status(page);
+        let mut value = if include_details {
+            manager.strict_pool_status(page)
+        } else {
+            manager.strict_pool_status_summary()
+        };
         value["runtime"] = crate::proxy::runtime_limits::LIMITS.info();
         value
     })

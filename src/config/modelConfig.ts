@@ -302,6 +302,16 @@ export const MODEL_CONFIG: Record<string, ModelConfig> = {
         group: 'Claude',
         tags: ['opus'],
     },
+    '[思考]claude-opus-4-6': {
+        label: '[思考]claude-opus-4-6',
+        shortLabel: 'Opus 4.6 思考',
+        protectedKey: 'claude',
+        Icon: Claude.Color,
+        i18nKey: 'proxy.model.claude_opus_thinking',
+        i18nDescKey: 'proxy.model.claude_opus_thinking',
+        group: 'Claude',
+        tags: ['opus', 'thinking'],
+    },
     'claude-opus-4-6-thinking': {
         label: 'Claude Opus 4.6 TK',
         shortLabel: 'Claude Opus 4.6 TK',

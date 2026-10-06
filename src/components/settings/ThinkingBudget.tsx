@@ -86,7 +86,7 @@ const DEFAULT_CONFIG: ThinkingBudgetConfig = {
     pro_high: 10001,
 
     claude_mode: "custom",
-    claude_budget: 16384,
+    claude_budget: 1024,
     claude_low: 1024,
     claude_medium: 4096,
     claude_high: 16384,
@@ -118,7 +118,7 @@ const BUDGET_DEFAULTS: Record<BudgetFieldKey, number> = {
     flash_tiered: -1,
     pro_low: 1001,
     pro_high: 10001,
-    claude_budget: 16384,
+    claude_budget: 1024,
     claude_low: 1024,
     claude_medium: 4096,
     claude_high: 16384,
@@ -1096,7 +1096,7 @@ export default function ThinkingBudget({
                                         <input
                                             type="text"
                                             inputMode="numeric"
-                                            placeholder="16384"
+                                            placeholder="1024"
                                             value={inputValues.claude_budget ?? ""}
                                             onChange={(e) =>
                                                 handleInputChange("claude_budget", e.target.value)
@@ -1105,7 +1105,7 @@ export default function ThinkingBudget({
                                         />
                                         <span className="text-xs font-medium text-gray-600 dark:text-gray-300">
                                             {t("proxy.config.thinking_budget.claude_budget_current", {
-                                                defaultValue: "推荐默认值: 16,384 Tokens (兼顾思考深度与响应速率)",
+                                                defaultValue: "默认值：1,024 Tokens；[思考] Opus 请求始终使用正数预算",
                                             })}
                                         </span>
                                     </div>

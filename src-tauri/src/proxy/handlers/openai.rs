@@ -1874,6 +1874,37 @@ pub async fn handle_chat_completions(
     let mut openai_req: OpenAIRequest = serde_json::from_value(body)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid request: {}", e)))?;
 
+    let requested_model = openai_req.model.clone();
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model,
+        );
+    let requested_thinking_budget = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens)
+        .or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.max_tokens))
+        .map(u64::from);
+    openai_req.model = thought_policy.routing_model(&requested_model).to_string();
+    if thought_policy
+        != crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
+            thinking_type: Some("enabled".to_string()),
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            effort: None,
+        });
+        openai_req.reasoning_effort = None;
+        if let Some(reasoning) = &mut openai_req.reasoning {
+            reasoning.effort = None;
+            reasoning.max_tokens = None;
+        }
+    }
+
     // Safety: Ensure messages is not empty
     if openai_req.messages.is_empty() {
         debug!("Received request with empty messages, injecting fallback...");
@@ -2260,6 +2291,7 @@ pub async fn handle_chat_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        thought_policy.apply_upstream(&mut gemini_body, requested_thinking_budget);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
@@ -2440,7 +2472,9 @@ pub async fn handle_chat_completions(
                     .unwrap_or(false);
                 let mut openai_stream = create_openai_sse_stream_with_anchor(
                     gemini_stream,
-                    openai_req.model.clone(),
+                    thought_policy
+                        .response_model(&requested_model, &openai_req.model)
+                        .to_string(),
                     session_id,
                     message_count,
                     Some(client_tool_names.clone()),
@@ -2605,7 +2639,9 @@ pub async fn handle_chat_completions(
                         let entry = crate::proxy::http_session_store::HttpSessionEntry {
                             input_items: save_msgs,
                             instructions: String::new(),
-                            model: openai_req.model.clone(),
+                            model: thought_policy
+                                .response_model(&requested_model, &openai_req.model)
+                                .to_string(),
                             last_accessed: std::time::Instant::now(),
                         };
                         let rid = chat_response_id.clone();
@@ -2722,12 +2758,18 @@ pub async fn handle_chat_completions(
                 }
             }
 
-            let openai_response = transform_openai_response(
+            let mut openai_response = transform_openai_response(
                 &gemini_resp,
                 Some(&session_id),
                 message_count,
                 Some(&client_tool_names),
             );
+            if !thought_policy.shows_thoughts() {
+                for choice in &mut openai_response.choices {
+                    choice.message.reasoning_content = None;
+                }
+            }
+
             if debug_logger::is_enabled(&debug_cfg) {
                 let converted_response = serde_json::to_value(&openai_response)
                     .unwrap_or_else(|e| json!({ "serialization_error": e.to_string() }));
@@ -2974,7 +3016,11 @@ pub async fn handle_chat_completions(
             }
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
+                if super::common::should_abort_client_retries(
+                    adapter.let_it_crash(),
+                    attempt,
+                    status_code,
+                ) {
                     tracing::warn!(
                         "[OpenAI] let_it_crash active: Aborting retries after attempt {}",
                         attempt
@@ -3756,6 +3802,37 @@ pub async fn handle_completions(
         }
     };
 
+    let requested_model = openai_req.model.clone();
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model,
+        );
+    let requested_thinking_budget = openai_req
+        .thinking
+        .as_ref()
+        .and_then(|t| t.budget_tokens)
+        .or_else(|| openai_req.reasoning.as_ref().and_then(|r| r.max_tokens))
+        .map(u64::from);
+    openai_req.model = thought_policy.routing_model(&requested_model).to_string();
+    if thought_policy
+        != crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        openai_req.thinking = Some(crate::proxy::mappers::openai::models::ThinkingConfig {
+            thinking_type: Some("enabled".to_string()),
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            effort: None,
+        });
+        openai_req.reasoning_effort = None;
+        if let Some(reasoning) = &mut openai_req.reasoning {
+            reasoning.effort = None;
+            reasoning.max_tokens = None;
+        }
+    }
+
     // Safety: Inject empty message if needed
     if openai_req.messages.is_empty() {
         openai_req
@@ -4121,6 +4198,7 @@ pub async fn handle_completions(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        thought_policy.apply_upstream(&mut gemini_body, requested_thinking_budget);
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&gemini_body);
         }
@@ -4283,7 +4361,9 @@ pub async fn handle_completions(
                         };
                         create_codex_sse_stream(
                             gemini_stream,
-                            openai_req.model.clone(),
+                            thought_policy
+                                .response_model(&requested_model, &openai_req.model)
+                                .to_string(),
                             session_id_str.clone(),
                             message_count,
                             assistant_turn_index,
@@ -4295,7 +4375,9 @@ pub async fn handle_completions(
                         use crate::proxy::mappers::openai::streaming::create_legacy_sse_stream;
                         create_legacy_sse_stream(
                             gemini_stream,
-                            openai_req.model.clone(),
+                            thought_policy
+                                .response_model(&requested_model, &openai_req.model)
+                                .to_string(),
                             session_id,
                             message_count,
                         )
@@ -4383,7 +4465,9 @@ pub async fn handle_completions(
                         let save_parent = session_parent;
                         let save_input = session_save_input;
                         let save_instructions = session_save_instructions;
-                        let save_model = openai_req.model.clone();
+                        let save_model = thought_policy
+                            .response_model(&requested_model, &openai_req.model)
+                            .to_string();
                         let rid = response_id_for_save.clone();
                         tokio::spawn(async move {
                             if let Ok((outputs, ack_tx)) = completion_rx.await {
@@ -4430,7 +4514,9 @@ pub async fn handle_completions(
                     // because we just want the content aggregation which chat stream does well.
                     let mut openai_stream = create_openai_sse_stream_with_anchor(
                         gemini_stream,
-                        openai_req.model.clone(),
+                        thought_policy
+                            .response_model(&requested_model, &openai_req.model)
+                            .to_string(),
                         if is_responses_api {
                             response_id_for_save.clone()
                         } else {
@@ -4541,7 +4627,9 @@ pub async fn handle_completions(
                                         session_save_input,
                                         outputs,
                                         session_save_instructions,
-                                        openai_req.model.clone(),
+                                        thought_policy
+                                            .response_model(&requested_model, &openai_req.model)
+                                            .to_string(),
                                         routing_session_id.clone(),
                                     )
                                     .await;
@@ -4686,12 +4774,18 @@ pub async fn handle_completions(
 
             crate::proxy::thinking_store::capture_gemini_response(&session_id_str, &gemini_resp);
 
-            let chat_resp = transform_openai_response(
+            let mut chat_resp = transform_openai_response(
                 &gemini_resp,
                 Some(&signature_session_id_str),
                 1,
                 Some(&client_tool_names),
             );
+
+            if !thought_policy.shows_thoughts() {
+                for choice in &mut chat_resp.choices {
+                    choice.message.reasoning_content = None;
+                }
+            }
 
             let is_responses_api = uri.path() == "/v1/responses";
 

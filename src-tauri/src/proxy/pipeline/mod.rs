@@ -9,6 +9,7 @@
 
 pub mod inbound;
 pub mod policy;
+pub mod thinking_policy;
 pub mod usage;
 
 pub use inbound::{extract_client_thinking_switch, InboundThinkingPipeline};

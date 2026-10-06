@@ -146,6 +146,12 @@ pub fn calculate_max_retry_attempts(_pool_size: usize) -> usize {
     6
 }
 
+/// Client fast-failure preferences must not truncate the five account rotations
+/// required for rate limits and temporary upstream unavailability.
+pub fn should_abort_client_retries(let_it_crash: bool, attempt: usize, status_code: u16) -> bool {
+    let_it_crash && attempt > 0 && !matches!(status_code, 429 | 503)
+}
+
 /// 根据错误状态码和错误信息确定重试策略
 pub fn determine_retry_strategy(
     status_code: u16,
@@ -338,6 +344,32 @@ pub fn determine_retry_strategy_adaptive(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn strict_opencode_rate_limit_retries_keep_all_five_rotations() {
+        use crate::proxy::common::client_adapter::ClientAdapter;
+        use crate::proxy::common::client_adapters::opencode::OpencodeAdapter;
+
+        let adapter = OpencodeAdapter;
+        for status in [429, 503] {
+            let mut used = 0;
+            let mut attempts = Vec::new();
+            while let Some(attempt) =
+                next_rotation_attempt(&mut used, calculate_max_retry_attempts(100), false)
+            {
+                attempts.push(attempt);
+                if should_abort_client_retries(adapter.let_it_crash(), attempt, status) {
+                    break;
+                }
+            }
+            assert_eq!(attempts, vec![0, 1, 2, 3, 4, 5]);
+        }
+        for status in [400, 403, 500, 502] {
+            assert!(!should_abort_client_retries(true, 0, status));
+            assert!(should_abort_client_retries(true, 1, status));
+            assert!(!should_abort_client_retries(false, 5, status));
+        }
+    }
 
     #[test]
     fn task_short_429_preserves_rotation_budget_and_structured_status() {

@@ -21,7 +21,6 @@ function Navbar() {
 
     // 创建导航项(包含翻译后的标签)
     const navItems: NavItem[] = [
-        { path: '/model-locks', label: '模型冷却', icon: Lock, priority: 'high' },
         { path: '/', label: t('nav.dashboard'), icon: LayoutDashboard, priority: 'high' },
         { path: '/accounts', label: t('nav.accounts'), icon: Users, priority: 'high' },
         { path: '/api-proxy', label: t('nav.proxy'), icon: Network, priority: 'high' },

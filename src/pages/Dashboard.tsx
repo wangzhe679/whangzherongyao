@@ -270,10 +270,8 @@ function Dashboard() {
         <div className="h-full w-full overflow-y-auto">
             <div
                 className="p-5 space-y-4 max-w-7xl mx-auto"
-                onMouseMove={() => console.log('Mouse moving over Dashboard')}
                 style={{ position: 'relative', zIndex: 1 }}
             >
-                <PoolControl />
                 {/* 问候语和操作按钮 */}
                 <div
                     className="flex justify-between items-center"
@@ -300,6 +298,10 @@ function Dashboard() {
                     </div>
                 </div>
 
+                <PoolControl />
+                <details className="rounded-xl border border-gray-200 dark:border-base-300 bg-white dark:bg-base-100">
+                    <summary className="p-3 cursor-pointer text-sm font-medium">账号健康与额度汇总</summary>
+                    <div className="p-4 pt-1 space-y-4">
                 {/* 1. 账号生态健康状态阵列 (4 核心卡片，以风控与配置定生死) */}
                 <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
                     {/* 总账号数 */}
@@ -570,6 +572,11 @@ function Dashboard() {
                     </div>
                 </div>
 
+                    </div>
+                </details>
+                <details className="rounded-xl border border-gray-200 dark:border-base-300 bg-white dark:bg-base-100">
+                    <summary className="p-3 cursor-pointer text-sm font-medium">当前账号与推荐账号</summary>
+                    <div className="p-4 pt-1">
                 {/* 双栏布局 */}
                 <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
                     <CurrentAccount
@@ -583,6 +590,8 @@ function Dashboard() {
                     />
                 </div>
 
+                    </div>
+                </details>
                 {/* 快速链接 */}
                 <div className="grid grid-cols-2 gap-3">
                     <button

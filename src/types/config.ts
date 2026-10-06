@@ -74,7 +74,7 @@ export interface ThinkingBudgetConfig {
 
     // --- Claude 系列配置 ---
     claude_mode?: ThinkingBudgetMode;
-    claude_budget?: number;    // 统一思考预算 (默认 16000, 填 -1 自适应)
+    claude_budget?: number;    // 统一思考预算 (默认 1024；[思考] Opus 请求始终使用正数)
     claude_low?: number;       // 默认 1024
     claude_medium?: number;    // 默认 4096
     claude_high?: number;      // 默认 16000

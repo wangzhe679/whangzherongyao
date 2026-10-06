@@ -3919,7 +3919,7 @@ pub fn get_canonical_families() -> Vec<CanonicalFamilyDto> {
 
             for match_id in std::iter::once(family.canonical_id)
                 .chain(family.aliases.iter().map(|(alias, _)| *alias))
-                .chain(family.tiers.iter().map(|(_, spec)| spec.id))
+                .chain(family.tiers.iter().map(|(_, spec)| spec.id.as_ref()))
             {
                 if normalized_match_ids.insert(match_id.to_lowercase()) {
                     match_ids.push(match_id.to_string());

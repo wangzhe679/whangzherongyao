@@ -654,7 +654,7 @@ pub struct ThinkingBudgetConfig {
     #[serde(default = "default_thinking_budget_mode")]
     pub claude_mode: ThinkingBudgetMode,
     #[serde(default = "default_claude_budget")]
-    pub claude_budget: i32, // 统一思考预算 (默认 16000, 填 -1 自适应)
+    pub claude_budget: i32, // 统一思考预算 (默认 1024, 填 -1 自适应)
     #[serde(default = "default_claude_low")]
     pub claude_low: i32, // 默认 1024
     #[serde(default = "default_claude_medium")]
@@ -708,7 +708,7 @@ fn default_pro_high() -> i32 {
 }
 
 fn default_claude_budget() -> i32 {
-    16384
+    1024
 }
 fn default_claude_low() -> i32 {
     1024

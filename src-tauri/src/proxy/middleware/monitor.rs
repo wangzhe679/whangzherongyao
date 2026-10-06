@@ -986,7 +986,10 @@ pub async fn monitor_middleware(
             log.response_headers = serde_json::to_string(&Value::Object(headers_map.clone())).ok();
 
             // Parse and consolidate stream data into readable format
-            if let Ok(full_response) = std::str::from_utf8(&all_stream_data) {
+            let stream_data_len = all_stream_data.len();
+            // Consume the buffer without copying it; raw-SSE fallback can then
+            // move the same allocation into the complete log body.
+            if let Ok(full_response) = String::from_utf8(all_stream_data) {
                 let mut thinking_content = String::new();
                 let mut response_content = String::new();
                 let mut thinking_signature = String::new();
@@ -1468,18 +1471,14 @@ pub async fn monitor_middleware(
                     .unwrap_or(true)
                 {
                     // Fallback: store raw SSE data if parsing failed
-                    log.response_body = Some(full_response.to_string());
+                    log.response_body = Some(full_response);
                 } else {
-                    log.response_body = Some(
-                        serde_json::to_string_pretty(&consolidated)
-                            .unwrap_or_else(|_| full_response.to_string()),
-                    );
+                    log.response_body =
+                        Some(serde_json::to_string_pretty(&consolidated).unwrap_or(full_response));
                 }
             } else {
-                log.response_body = Some(format!(
-                    "[Binary Stream Data: {} bytes]",
-                    all_stream_data.len()
-                ));
+                log.response_body =
+                    Some(format!("[Binary Stream Data: {} bytes]", stream_data_len));
             }
 
             // Fallback token extraction from tail if not already extracted

@@ -29,6 +29,61 @@ use crate::proxy::upstream::client::mask_email;
 use axum::http::HeaderMap;
 use std::sync::{atomic::Ordering, Arc}; // [NEW]
 
+fn non_stream_preceding_turn(payload: &Value, actual_stream: bool) -> Option<Value> {
+    if actual_stream {
+        return None;
+    }
+    payload
+        .pointer("/request/contents")
+        .or_else(|| payload.get("contents"))
+        .and_then(Value::as_array)
+        .and_then(|contents| contents.last())
+        .cloned()
+}
+
+#[cfg(test)]
+mod non_stream_capture_tests {
+    use super::*;
+
+    #[test]
+    fn claude_non_stream_capture_keeps_repeated_tool_calls_in_distinct_causal_turns() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = crate::proxy::thinking_store::ThinkingStore::global();
+        let key = "claude-non-stream-causal-capture";
+        let first = json!({"request":{"contents":[
+            {"role":"user","parts":[{"text":"run the command"}]}
+        ]}});
+        let second = json!({"request":{"contents":[
+            {"role":"model","parts":[{"functionCall":{"name":"bash","args":{"cmd":"pwd"}}}]},
+            {"role":"user","parts":[{"functionResponse":{"name":"bash","response":{"output":"/work"}}}]}
+        ]}});
+        assert!(non_stream_preceding_turn(&first, true).is_none());
+        let first_turn = non_stream_preceding_turn(&first, false).unwrap();
+        let second_turn = non_stream_preceding_turn(&second, false).unwrap();
+        assert_eq!(second_turn, second["request"]["contents"][1]);
+        for (turn, thought) in [
+            (&first_turn, "first independent thought"),
+            (&second_turn, "second independent thought"),
+        ] {
+            let response = json!({"response":{"candidates":[{"content":{"parts":[
+                {"thought":true,"text":thought},
+                {"functionCall":{"name":"bash","args":{"cmd":"pwd"}}}
+            ]}}]}});
+            crate::proxy::thinking_store::capture_gemini_response_with_preceding(
+                key,
+                &response,
+                Some(turn),
+            );
+        }
+        assert_eq!(store.session_stats(key).map(|(turns, _)| turns), Some(2));
+        let persisted = crate::modules::proxy_db::load_thinking_records(key).unwrap();
+        assert_eq!(persisted.len(), 2);
+        assert_eq!(persisted[0].thought, "first independent thought");
+        assert_eq!(persisted[1].thought, "second independent thought");
+        store.end_session(key);
+    }
+}
+
 // ===== Task #6: OpenCode variants thinking config mapping =====
 // Helper structs for parsing thinking hints from raw JSON
 #[derive(Debug, Clone)]
@@ -489,6 +544,30 @@ pub async fn handle_messages(
             }
         };
 
+    let requested_model = request.model.clone();
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model,
+        );
+    let requested_thinking_budget = extract_thinking_hint(&original_body)
+        .budget_tokens
+        .map(u64::from);
+    request.model = thought_policy.routing_model(&requested_model).to_string();
+    if thought_policy
+        != crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            effort: None,
+        });
+        request.output_config = None;
+    }
+
     // [Variant] Resolve canonical model + variant → real model + real params.
     let model_lower = request.model.to_lowercase();
     let is_v3_or_above = model_specs::is_gemini_v3_or_above(&request.model);
@@ -497,7 +576,20 @@ pub async fn handle_messages(
         || model_lower.ends_with("-low")
         || model_lower.ends_with("-extra-low");
 
-    let thinking_hint = extract_thinking_hint(&original_body);
+    let thinking_hint = if thought_policy
+        == crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        extract_thinking_hint(&original_body)
+    } else {
+        ThinkingHint {
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            level: None,
+        }
+    };
     let tb_config = crate::proxy::config::get_thinking_budget_config();
     let is_client_control =
         tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
@@ -1204,6 +1296,7 @@ pub async fn handle_messages(
             &mut gemini_body,
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        thought_policy.apply_upstream(&mut gemini_body, requested_thinking_budget);
 
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         let tf_micros = transform_timing.think_fill_micros;
@@ -1283,6 +1376,10 @@ pub async fn handle_messages(
 
         // [Stage 4 Timing] 等待谷歌上游首包计时起点
         let upstream_req_start = std::time::Instant::now();
+
+        // The direct JSON fallback needs the exact causal turn sent upstream.
+        // The active SSE path captures its own tool IDs without cloning contents.
+        let non_stream_preceding = non_stream_preceding_turn(&gemini_body, actual_stream);
 
         let call_result = match upstream
             .call_v1_internal_with_headers(
@@ -1399,6 +1496,7 @@ pub async fn handle_messages(
                     current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                     client_adapter.clone(), // [NEW] Pass client adapter
                     registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
+                    thought_policy.shows_thoughts(),
                 );
 
                 let mut first_data_chunk = None;
@@ -1627,7 +1725,7 @@ pub async fn handle_messages(
                     .map(|tools| tools.iter().filter_map(|t| t.name.clone()).collect())
                     .unwrap_or_default();
                 // 转换
-                let claude_response = match transform_response(
+                let mut claude_response = match transform_response(
                     &gemini_response,
                     scaling_enabled,
                     context_limit,
@@ -1645,6 +1743,17 @@ pub async fn handle_messages(
                             .into_response()
                     }
                 };
+
+                crate::proxy::thinking_store::capture_gemini_response_with_preceding(
+                    &session_id_str,
+                    &gemini_resp,
+                    non_stream_preceding.as_ref(),
+                );
+                if !thought_policy.shows_thoughts() {
+                    claude_response.content.retain(|block| !matches!(block,
+                        crate::proxy::mappers::claude::models::ContentBlock::Thinking { .. } |
+                        crate::proxy::mappers::claude::models::ContentBlock::RedactedThinking { .. }));
+                }
 
                 // [Optimization] 记录闭环日志：消耗情况
                 let cache_info = if let Some(cached) = claude_response.usage.cache_read_input_tokens

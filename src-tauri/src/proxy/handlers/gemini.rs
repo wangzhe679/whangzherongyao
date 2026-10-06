@@ -85,6 +85,15 @@ pub async fn handle_generate(
         (model_action, "generateContent".to_string())
     };
 
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(&model_name);
+    let requested_thinking_budget = body
+        .pointer("/generationConfig/thinkingConfig/thinkingBudget")
+        .or_else(|| body.pointer("/generation_config/thinking_config/thinking_budget"))
+        .and_then(Value::as_u64);
+    let model_name = thought_policy.routing_model(&model_name).to_string();
+    thought_policy.configure_request(&mut body, requested_thinking_budget);
+
     crate::modules::logger::log_info(&format!(
         "Received Gemini request: {}/{}",
         model_name, method
@@ -322,6 +331,7 @@ pub async fn handle_generate(
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(
             &mut wrapped_body,
         );
+        thought_policy.apply_upstream(&mut wrapped_body, requested_thinking_budget);
 
         if let Some(ref recorder) = upstream_recorder {
             recorder.set_value(&wrapped_body);
@@ -636,6 +646,8 @@ pub async fn handle_generate(
                                             // [FIX #1522] Inject Tool ID into Stream Response
                                             crate::proxy::mappers::gemini::wrapper::inject_ids_to_response(&mut json, &model_name_for_stream);
 
+                                            if client_wants_stream { thought_policy.filter_gemini_output(&mut json); }
+
                                             // Unwrap v1internal response wrapper
                                             if let Some(inner) = json.get_mut("response").map(|v| v.take()) {
                                                 let new_line = format!("data: {}\n\n", serde_json::to_string(&inner).unwrap_or_default());
@@ -707,11 +719,12 @@ pub async fn handle_generate(
                     )
                     .await
                     {
-                        Ok(gemini_resp) => {
+                        Ok(mut gemini_resp) => {
                             info!(
                                 "[{}] ✓ Stream collected and converted to JSON (Gemini)",
                                 session_id
                             );
+                            thought_policy.filter_gemini_output(&mut gemini_resp);
                             let unwrapped = unwrap_response(&gemini_resp);
                             return Ok(Response::builder()
                                 .status(StatusCode::OK)
@@ -790,6 +803,7 @@ pub async fn handle_generate(
                 &gemini_resp,
                 preceding_turn,
             );
+            thought_policy.filter_gemini_output(&mut gemini_resp);
             let unwrapped = unwrap_response(&gemini_resp);
             return Ok(Response::builder()
                 .status(StatusCode::OK)
@@ -1013,7 +1027,11 @@ pub async fn handle_generate(
             }
             // [NEW] Apply Client Adapter "let_it_crash" strategy
             if let Some(adapter) = &client_adapter {
-                if adapter.let_it_crash() && attempt > 0 {
+                if super::common::should_abort_client_retries(
+                    adapter.let_it_crash(),
+                    attempt,
+                    status_code,
+                ) {
                     tracing::warn!(
                         "[Gemini] let_it_crash active: Aborting retries after attempt {}",
                         attempt

@@ -82,6 +82,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(&model);
     let mut buffer = BytesMut::new();
     let stream_id = format!("chatcmpl-{}", Uuid::new_v4());
     let created_ts = Utc::now().timestamp();
@@ -261,7 +263,7 @@ where
                                                         gemini_finish_reason
                                                     };
 
-                                                    if !thought_out.is_empty() {
+                                                    if thought_policy.shows_thoughts() && !thought_out.is_empty() {
                                                         let reasoning_chunk = json!({
                                                             "id": &stream_id,
                                                             "object": "chat.completion.chunk",
@@ -384,6 +386,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(&model);
     let mut buffer = BytesMut::new();
     let charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
     let mut rng = rand::thread_rng();
@@ -429,10 +433,10 @@ where
                                                             thinking_acc.ingest_part(part);
                                                             let is_thought = part.get("thought").and_then(|v| v.as_bool()).unwrap_or(false);
                                                             if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                                if is_thought {
+                                                                if is_thought && thought_policy.shows_thoughts() {
                                                                     let clean_text = text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "");
                                                                     content_out.push_str(&clean_text);
-                                                                } else {
+                                                                } else if !is_thought {
                                                                     content_out.push_str(text);
                                                                 }
                                                             }
@@ -540,6 +544,8 @@ where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
     E: std::fmt::Display + Send + 'static,
 {
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(&model);
     let mut buffer = BytesMut::new();
     let item_id_prefix = uuid::Uuid::new_v4().simple().to_string();
     let message_item_id = format!("msg_{}_0", &item_id_prefix[..16]);
@@ -674,13 +680,15 @@ where
                                                         }
 
                                                         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
-                                                            let clean_text = if is_thought {
+                                                            let clean_text = if is_thought && !thought_policy.shows_thoughts() {
+                                                                String::new()
+                                                            } else if is_thought {
                                                                 text.replace("<think>\n", "").replace("<think>", "").replace("\n</think>", "").replace("</think>", "")
                                                             } else {
                                                                 text.to_string()
                                                             };
                                                             if !clean_text.is_empty() {
-                                                                if is_thought && message_item_emitted {
+                                                                if is_thought && message_item_emitted && thought_policy != crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Visible {
                                                                     // Once ordinary assistant text has started, it is the
                                                                     // authoritative result for this response. A late thought
                                                                     // delta must not be appended to it or open an overlapping

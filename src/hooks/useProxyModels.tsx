@@ -53,6 +53,7 @@ const ALIAS_TO_CANONICAL: Record<string, { id: string; name: string; group: stri
     'claude-sonnet-4-6': { id: 'claude-sonnet-4-6', name: 'claude-sonnet-4-6', group: 'Claude' },
     'claude-sonnet-4-6-thinking': { id: 'claude-sonnet-4-6-thinking', name: 'claude-sonnet-4-6-thinking', group: 'Claude' },
     'claude-opus-4-6': { id: 'claude-opus-4-6', name: 'claude-opus-4-6', group: 'Claude' },
+    '[思考]claude-opus-4-6': { id: '[思考]claude-opus-4-6', name: '[思考]claude-opus-4-6', group: 'Claude' },
     'claude-opus-4-6-thinking': { id: 'claude-opus-4-6-thinking', name: 'claude-opus-4-6-thinking', group: 'Claude' },
     'claude-sonnet-4-5': { id: 'claude-sonnet-4-5', name: 'claude-sonnet-4-5', group: 'Claude' },
     'claude-sonnet-4-5-thinking': { id: 'claude-sonnet-4-5-thinking', name: 'claude-sonnet-4-5-thinking', group: 'Claude' },

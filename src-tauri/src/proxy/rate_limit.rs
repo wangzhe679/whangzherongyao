@@ -174,6 +174,44 @@ impl RateLimitTracker {
         true
     }
 
+    /// Account snapshots do not carry lock_type. Recover it only from positive
+    /// upstream evidence; a timed transient lock must never become a pool lock.
+    pub fn restore_live_limit_status(
+        &self,
+        account_id: &str,
+        model: &str,
+        status: &crate::models::account::LiveLimitStatus,
+    ) {
+        let now = chrono::Utc::now().timestamp();
+        if !is_active_persisted_long_limit(model, status, now) {
+            return;
+        }
+        let message = status.message.as_deref().unwrap_or("");
+        let lower = message.to_ascii_lowercase();
+        let proved_deadline =
+            crate::proxy::model_locks::upstream_deadline(message, None, status.detected_at)
+                .is_some_and(|until| until > status.detected_at);
+        let exact = status.status == 429
+            && (status.reason == "ExactUpstreamDeadline"
+            || (proved_deadline && (lower.contains("quota_exhausted") || lower.contains("rate_limit_exceeded")))
+            // The legacy image-only persistence path already required a true
+            // quota response and saved its accepted absolute deadline.
+            || (normalize_image_model_id(model).is_some() && status.reason == "QuotaExhausted"));
+        self.strict.restore(
+            account_id,
+            crate::proxy::model_locks::ModelLock {
+                model: crate::proxy::model_locks::model_key(model),
+                status: status.status,
+                reason: status.reason.clone(),
+                until: status.until,
+                detected_at: status.detected_at,
+                lock_type: if exact { "exact" } else { "short_timed" }.into(),
+                transient_count: 0,
+                message: message.chars().take(600).collect(),
+            },
+        );
+    }
+
     pub fn restore_persisted_long_image_limit(
         &self,
         account_id: &str,
@@ -280,7 +318,8 @@ impl RateLimitTracker {
         let now = chrono::Utc::now().timestamp();
         let deadline = crate::proxy::model_locks::upstream_deadline(body, retry_after_header, now)
             .filter(|until| *until > now);
-        let timed_model = model.starts_with("gemini") || model.starts_with("claude");
+        let key = crate::proxy::model_locks::model_key(&model);
+        let timed_model = key.starts_with("gemini") || key.starts_with("claude");
         let exact = status == 429
             && deadline.is_some()
             && (lower.contains("quota_exhausted")
@@ -361,6 +400,69 @@ impl Default for RateLimitTracker {
 #[cfg(test)]
 mod strict_tests {
     use super::*;
+
+    #[test]
+    fn strict_parser_shares_only_proven_429_and_normalizes_thinking_alias() {
+        let tracker = RateLimitTracker::new();
+        for (account, status, body, header, shared) in [
+            ("quota", 429, "QUOTA_EXHAUSTED", Some("901"), true),
+            ("rate", 429, "RATE_LIMIT_EXCEEDED", Some("902"), true),
+            ("generic", 429, "too many requests", Some("903"), false),
+            ("missing-time", 429, "QUOTA_EXHAUSTED", None, false),
+            (
+                "capacity",
+                429,
+                "MODEL_CAPACITY_EXHAUSTED",
+                Some("904"),
+                false,
+            ),
+            ("service", 503, "QUOTA_EXHAUSTED", Some("905"), false),
+        ] {
+            let value = tracker
+                .parse_from_error(
+                    account,
+                    status,
+                    header,
+                    body,
+                    Some("[思考]claude-opus-4-6".into()),
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(value.model.as_deref(), Some("claude-opus-4-6-thinking"));
+            assert_eq!(
+                tracker.get_remaining_wait(account, Some("claude-sonnet-4-6")) > 0,
+                shared
+            );
+            assert!(tracker.get_remaining_wait(account, Some("claude-opus-4-6")) > 0);
+        }
+    }
+
+    #[test]
+    fn strict_snapshot_restore_does_not_promote_fake_locks_into_pool_locks() {
+        let tracker = RateLimitTracker::new();
+        let now = chrono::Utc::now().timestamp();
+        let mut value = crate::models::account::LiveLimitStatus {
+            model: "claude-opus-4-6-thinking".into(),
+            status: 429,
+            reason: "TransientRateLimit".into(),
+            until: now + 600,
+            detected_at: now,
+            message: Some("busy".into()),
+        };
+        tracker.restore_live_limit_status("fake", &value.model, &value);
+        assert_eq!(
+            tracker.get_remaining_wait("fake", Some("claude-sonnet-4-6")),
+            0
+        );
+        assert!(tracker.get_remaining_wait("fake", Some(&value.model)) > 0);
+        value.reason = "ExactUpstreamDeadline".into();
+        tracker.restore_live_limit_status("true", &value.model, &value);
+        assert!(tracker.get_remaining_wait("true", Some("claude-sonnet-4-6")) > 0);
+        value.reason = "RateLimitExceeded".into();
+        value.message = Some(r#"{"reason":"RATE_LIMIT_EXCEEDED","retryDelay":"600s"}"#.into());
+        tracker.restore_live_limit_status("proved", &value.model, &value);
+        assert!(tracker.get_remaining_wait("proved", Some("claude-sonnet-4-6")) > 0);
+    }
     #[test]
     fn strict_invalid_deadlines_fall_back_without_unlocking_and_529_is_ignored() {
         let t = RateLimitTracker::new();
@@ -434,7 +536,10 @@ mod strict_tests {
             )
             .unwrap();
         assert_eq!(l.retry_after_sec, 451);
-        assert_eq!(t.strict.get("a", "claude").unwrap().lock_type, "exact");
+        assert_eq!(
+            t.strict.get("a", "claude-sonnet-4-6").unwrap().lock_type,
+            "exact"
+        );
         assert_eq!(
             t.parse_from_error(
                 "a",

@@ -7,6 +7,8 @@
 //!
 //! 所有数值为已校准的目标模型参数。
 
+use std::borrow::Cow;
+
 /// Variant tier inferred from the client's `thinking.budget_tokens`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum VariantTier {
@@ -36,10 +38,10 @@ pub struct CanonicalFamily {
 }
 
 /// A resolved real model with its verified request params.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct RealModelSpec {
     /// The real model ID to put in the upstream `model` field.
-    pub id: &'static str,
+    pub id: Cow<'static, str>,
     /// verified thinkingBudget (0 means no thinking).
     pub thinking_budget: u32,
     /// verified maxOutputTokens.
@@ -136,7 +138,7 @@ pub fn resolve_real_model(canonical: &str, tier: VariantTier) -> Option<RealMode
             .tiers
             .iter()
             .find(|(candidate_tier, _)| *candidate_tier == resolved_tier)
-            .map(|(_, spec)| *spec);
+            .map(|(_, spec)| spec.clone());
     }
 
     None
@@ -269,9 +271,8 @@ pub fn resolve_with_tier(
             }
         };
         let max_output_tokens = if lower.contains("pro") { 65535 } else { 65536 };
-        let id: &'static str = Box::leak(resolved_id.into_boxed_str());
         return Some(RealModelSpec {
-            id,
+            id: Cow::Owned(resolved_id),
             thinking_budget: budget,
             max_output_tokens,
             include_thoughts: true,
@@ -290,21 +291,21 @@ pub fn resolve(canonical: &str, budget_tokens: Option<u32>) -> Option<RealModelS
 // ── verified real model specs (from upstream spec) ──
 // gemini-3.5-flash family (maxOutputTokens = 65536)
 const SPEC_35_FLASH_EXTRA_LOW: RealModelSpec = RealModelSpec {
-    id: "gemini-3.5-flash-extra-low",
+    id: Cow::Borrowed("gemini-3.5-flash-extra-low"),
     thinking_budget: 1000,
     max_output_tokens: 65536,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_35_FLASH_LOW: RealModelSpec = RealModelSpec {
-    id: "gemini-3.5-flash-low",
+    id: Cow::Borrowed("gemini-3.5-flash-low"),
     thinking_budget: 4000,
     max_output_tokens: 65536,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_3_FLASH_AGENT: RealModelSpec = RealModelSpec {
-    id: "gemini-3-flash-agent",
+    id: Cow::Borrowed("gemini-3-flash-agent"),
     thinking_budget: 10000,
     max_output_tokens: 65536,
     include_thoughts: true,
@@ -313,14 +314,14 @@ const SPEC_3_FLASH_AGENT: RealModelSpec = RealModelSpec {
 
 // gemini-3.1-pro family (maxOutputTokens = 65535 — note the off-by-one vs Flash)
 const SPEC_31_PRO_LOW: RealModelSpec = RealModelSpec {
-    id: "gemini-3.1-pro-low",
+    id: Cow::Borrowed("gemini-3.1-pro-low"),
     thinking_budget: 1001,
     max_output_tokens: 65535,
     include_thoughts: true,
     preserve_client_budget: false,
 };
 const SPEC_PRO_AGENT: RealModelSpec = RealModelSpec {
-    id: "gemini-pro-agent",
+    id: Cow::Borrowed("gemini-pro-agent"),
     thinking_budget: 10001,
     max_output_tokens: 65535,
     include_thoughts: true,
@@ -329,28 +330,28 @@ const SPEC_PRO_AGENT: RealModelSpec = RealModelSpec {
 
 // Non-variant models
 const SPEC_31_FLASH_LITE: RealModelSpec = RealModelSpec {
-    id: "gemini-3.1-flash-lite",
+    id: Cow::Borrowed("gemini-3.1-flash-lite"),
     thinking_budget: 0,
     max_output_tokens: 16384,
     include_thoughts: false,
     preserve_client_budget: false,
 };
 const SPEC_CLAUDE_SONNET_46: RealModelSpec = RealModelSpec {
-    id: "claude-sonnet-4-6",
+    id: Cow::Borrowed("claude-sonnet-4-6"),
     thinking_budget: 1024,
     max_output_tokens: 64000,
     include_thoughts: true,
     preserve_client_budget: true,
 };
 const SPEC_CLAUDE_OPUS_46: RealModelSpec = RealModelSpec {
-    id: "claude-opus-4-6-thinking",
+    id: Cow::Borrowed("claude-opus-4-6-thinking"),
     thinking_budget: 1024,
     max_output_tokens: 64000,
     include_thoughts: true,
     preserve_client_budget: true,
 };
 const SPEC_GPT_OSS_120B: RealModelSpec = RealModelSpec {
-    id: "gpt-oss-120b-medium",
+    id: Cow::Borrowed("gpt-oss-120b-medium"),
     thinking_budget: 8192,
     max_output_tokens: 32768,
     include_thoughts: true,
@@ -971,6 +972,18 @@ mod tests {
             8192,
             32768,
         );
+    }
+
+    #[test]
+    fn dynamic_model_id_is_owned_and_can_be_released() {
+        let spec = resolve_with_tier("gemini-3.9-flash", None, None).unwrap();
+        assert!(matches!(&spec.id, Cow::Owned(_)));
+        assert_eq!(spec.id, "gemini-3.9-flash-tiered");
+        // A subsequent resolution is an independent value, with identical routing.
+        let next = resolve_with_tier("gemini-3.9-flash", None, None).unwrap();
+        assert_eq!(spec.id, next.id);
+        drop(spec);
+        assert_eq!(next.id, "gemini-3.9-flash-tiered");
     }
 
     #[test]

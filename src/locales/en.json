@@ -1067,7 +1067,7 @@
         "days_unit": "days",
         "claude_budget_title": "Claude Thinking Model Budget (Tokens)",
         "claude_budget_desc": "Core token budget when client calls thinking models like claude-3-7-sonnet-thinking (-1 for upstream default)",
-        "claude_budget_current": "Recommended default: 16,384 Tokens (balanced depth and latency)",
+        "claude_budget_current": "Default: 1,024 tokens; [思考] Opus requests always use a positive budget",
         "claude_hide_advanced": "Collapse Client Effort Mapping",
         "claude_show_advanced": "Advanced: Client Effort Tier Mapping (low / medium / high)",
         "claude_effort_mapping_desc": "When commercial agents (Cline, Roo, etc.) send reasoning_effort in parameters or headers, budgets are mapped as follows:",

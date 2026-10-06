@@ -3,6 +3,14 @@
 > Complete version history for Antigravity Tools. Return to project home at [README_EN.md](README_EN.md).
 
 *   **Version History**:
+    *   **v4.8.4-beta.1-fixed.4 (2026-10-06)**:
+        -   **[anti-4.8-1 customization] Independent model cooldowns and confirmed quota pools**:
+            -   Requested by @wangzhe679: track seven models separately; share only confirmed true 429 deadlines within the Claude pair and Gemini main quartet. Keep Lite and transient locks independent, preserve saved deadlines, and protect legacy/reimported accounts and duplicate email ledgers. Fix complete day/fractional text duration parsing.
+        -   **[Thinking and memory] Opus visibility, default budget 1024, and safe cache reclamation**:
+            -   Plain Opus hides thoughts; the [思考] prefix exposes actual upstream thoughts. Preserve Gateway/Client budget authority. Fix leaked strings and concurrent cache upgrades; reclaim only reliably persisted idle state while retaining complete SQLite history and traffic logs.
+        -   **[Dashboard and regressions] Compact statistics and five account retries**:
+            -   Remove the standalone cooldown page while retaining account details. Show model lock types and expiry distributions; preserve five retries for OpenCode 429/503 requests. 112 distinct local regression cases passed across validation rounds. Real upstream identity, all-model 400 behavior, and sustained production load remain unverified; no server deployment is performed.
+
     *   **v4.8.4-beta.1 (2026-09-27)**:
         -   **[Signature Fidelity & Healing] Eliminate Destructive Base64 Decoding in Claude Adapter, Support Raw Protobuf Signatures, and Introduce In-Place Database Write-Back Healing**:
             -   **Root cause eliminated**: Completely eliminated the flawed logic in `claude/streaming.rs` and `claude/response.rs` that attempted `String::from_utf8` on decoded Gemini signatures. Gemini `thoughtSignature` payloads are raw Protobuf bytes (initial byte `0x12`). When all byte values fell in ASCII range, `from_utf8` succeeded and corrupted 56-char Base64 signatures into 40-byte raw control characters, causing next-turn lookups to drop them for length `< 50`, resulting in upstream `Function call is missing a thought_signature (400)`.

@@ -16,6 +16,7 @@ const SESSION_CACHE_LIMIT: usize = 1000; // Layer 3: Session-based signatures (l
 struct CacheEntry<T> {
     data: T,
     timestamp: SystemTime,
+    reloadable: bool,
 }
 
 /// Specialized entry for session-based signatures to track message count
@@ -30,6 +31,7 @@ impl<T> CacheEntry<T> {
         Self {
             data,
             timestamp: SystemTime::now(),
+            reloadable: false,
         }
     }
 
@@ -99,26 +101,21 @@ impl SignatureCache {
         let id_str = norm_id.to_string();
 
         // 1. 持久化到 SQLite L2 数据库 (支持代理重启后秒级恢复)
-        let _ = crate::modules::proxy_db::save_tool_signature(&id_str, &signature);
+        // The DB API also returns Ok for values it intentionally skips (e.g.
+        // the validator sentinel). Those accepted L1 values are not reloadable.
+        let saved = crate::modules::proxy_db::save_tool_signature(&id_str, &signature).is_ok();
+        let persisted = saved
+            && !id_str.is_empty()
+            && crate::modules::proxy_db::normalize_and_heal_signature(&signature)
+                .is_some_and(|normalized| normalized == signature);
 
         // 2. 写入内存 L1 缓存
         if let Ok(mut cache) = self.tool_signatures.lock() {
             tracing::debug!("[SignatureCache] Caching tool signature for id: {}", id_str);
-            cache.insert(id_str, CacheEntry::new(signature));
-
-            // Clean up expired entries when limit is reached
-            if cache.len() > TOOL_CACHE_LIMIT {
-                let before = cache.len();
-                cache.retain(|_, v| !v.is_expired());
-                let after = cache.len();
-                if before != after {
-                    tracing::debug!(
-                        "[SignatureCache] Tool cache cleanup: {} -> {} entries",
-                        before,
-                        after
-                    );
-                }
-            }
+            let mut entry = CacheEntry::new(signature);
+            entry.reloadable = persisted;
+            cache.insert(id_str, entry);
+            Self::trim_tool_cache(&mut cache, TOOL_CACHE_LIMIT);
         }
     }
 
@@ -148,7 +145,10 @@ impl SignatureCache {
             if let Ok(Some(sig)) = crate::modules::proxy_db::load_tool_signature(candidate) {
                 let sig: String = sig;
                 if let Ok(mut cache) = self.tool_signatures.lock() {
-                    cache.insert(norm_id.to_string(), CacheEntry::new(sig.clone()));
+                    let mut entry = CacheEntry::new(sig.clone());
+                    entry.reloadable = true;
+                    cache.insert(norm_id.to_string(), entry);
+                    Self::trim_tool_cache(&mut cache, TOOL_CACHE_LIMIT);
                 }
                 tracing::info!(
                     "[SignatureCache] Restored tool signature from SQLite for id: {}",
@@ -159,6 +159,46 @@ impl SignatureCache {
         }
 
         None
+    }
+
+    fn trim_tool_cache(cache: &mut HashMap<String, CacheEntry<String>>, limit: usize) {
+        if cache.len() <= limit {
+            return;
+        }
+        cache.retain(|_, entry| !entry.is_expired());
+        let mut candidates: Vec<_> = cache
+            .iter()
+            .filter(|(_, entry)| entry.reloadable)
+            .map(|(key, entry)| (key.clone(), entry.timestamp))
+            .collect();
+        candidates.sort_unstable_by_key(|(_, timestamp)| *timestamp);
+        for (key, _) in candidates {
+            if cache.len() <= limit {
+                break;
+            }
+            cache.remove(&key);
+        }
+    }
+
+    /// TTL cleanup has the same availability semantics as lookups. Family and
+    /// session entries have no reliable L2 source, so valid entries stay intact.
+    pub fn evict_expired(&self) -> usize {
+        fn clean<T>(cache: &Mutex<HashMap<String, CacheEntry<T>>>) -> usize {
+            let Ok(mut cache) = cache.lock() else {
+                return 0;
+            };
+            let before = cache.len();
+            cache.retain(|_, entry| !entry.is_expired());
+            let removed = before - cache.len();
+            if removed > 0 {
+                cache.shrink_to_fit();
+            }
+            removed
+        }
+        clean(&self.tool_signatures)
+            + clean(&self.thinking_families)
+            + clean(&self.session_signatures)
+            + clean(&self.session_reasonings)
     }
 
     /// Store model family for a signature
@@ -479,6 +519,111 @@ impl SignatureCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_reclamation_tool_signature_limit_restores_sqlite() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let cache = SignatureCache::new();
+        let signature = "reloadable-tool-signature".repeat(5);
+        cache.cache_tool_signature("call_memory_reclaim", signature.clone());
+        {
+            let mut entries = cache.tool_signatures.lock().unwrap();
+            assert!(entries["call_memory_reclaim"].reloadable);
+            SignatureCache::trim_tool_cache(&mut entries, 0);
+            assert!(entries.is_empty());
+        }
+        assert_eq!(
+            cache.get_tool_signature("call_memory_reclaim"),
+            Some(signature)
+        );
+    }
+
+    #[test]
+    fn memory_reclamation_tool_signature_keeps_failed_sqlite_write() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let db_path = crate::modules::proxy_db::get_proxy_db_path().unwrap();
+        std::fs::create_dir_all(db_path).unwrap();
+        let cache = SignatureCache::new();
+        let signature = "nonpersisted-tool-signature".repeat(5);
+        cache.cache_tool_signature("call_memory_failed", signature.clone());
+        {
+            let mut entries = cache.tool_signatures.lock().unwrap();
+            assert!(!entries["call_memory_failed"].reloadable);
+            SignatureCache::trim_tool_cache(&mut entries, 0);
+            assert_eq!(entries.len(), 1);
+        }
+        assert_eq!(
+            cache.get_tool_signature("call_memory_failed"),
+            Some(signature)
+        );
+    }
+
+    #[test]
+    fn memory_reclamation_tool_signature_keeps_values_skipped_by_sqlite() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let cache = SignatureCache::new();
+        let signature = crate::modules::proxy_db::SENTINEL_SIGNATURE.to_string();
+        assert!(signature.len() >= MIN_SIGNATURE_LENGTH);
+        cache.cache_tool_signature("call_memory_sentinel", signature.clone());
+        {
+            let mut entries = cache.tool_signatures.lock().unwrap();
+            assert!(!entries["call_memory_sentinel"].reloadable);
+            SignatureCache::trim_tool_cache(&mut entries, 0);
+            assert_eq!(entries.len(), 1);
+        }
+        assert!(
+            crate::modules::proxy_db::load_tool_signature("call_memory_sentinel")
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            cache.get_tool_signature("call_memory_sentinel"),
+            Some(signature)
+        );
+    }
+
+    #[test]
+    fn memory_reclamation_tool_signature_preserves_sqlite_healing() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        crate::modules::proxy_db::init_db().unwrap();
+        let cache = SignatureCache::new();
+        let signature = format!("\u{12}{}", "raw-tool-signature".repeat(5));
+        let healed = crate::modules::proxy_db::normalize_and_heal_signature(&signature).unwrap();
+        assert_ne!(healed, signature);
+        cache.cache_tool_signature("call_memory_healed", signature.clone());
+        {
+            let mut entries = cache.tool_signatures.lock().unwrap();
+            assert!(entries["call_memory_healed"].reloadable);
+            SignatureCache::trim_tool_cache(&mut entries, 0);
+            assert!(entries.is_empty());
+        }
+        assert_eq!(
+            crate::modules::proxy_db::load_tool_signature("call_memory_healed").unwrap(),
+            Some(healed.clone())
+        );
+        assert_eq!(cache.get_tool_signature("call_memory_healed"), Some(healed));
+    }
+
+    #[test]
+    fn memory_reclamation_signature_cleanup_preserves_valid_session_state() {
+        let cache = SignatureCache::new();
+        cache.cache_session_reasoning("expired", "expired reasoning".to_string(), 0);
+        cache.cache_session_reasoning("active", "complete reasoning".to_string(), 0);
+        cache.cache_session_signature("active", "valid-signature".repeat(8), 10);
+        {
+            let mut entries = cache.session_reasonings.lock().unwrap();
+            entries.get_mut("expired").unwrap().timestamp =
+                SystemTime::now() - SIGNATURE_TTL - Duration::from_secs(1);
+        }
+        assert_eq!(cache.evict_expired(), 1);
+        assert_eq!(
+            cache.get_session_reasoning("active", 0).as_deref(),
+            Some("complete reasoning")
+        );
+        assert!(cache.get_session_signature("active").is_some());
+    }
 
     #[test]
     fn test_tool_signature_cache() {

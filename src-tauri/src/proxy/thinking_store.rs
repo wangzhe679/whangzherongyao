@@ -16,6 +16,7 @@ use dashmap::DashMap;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -26,13 +27,11 @@ fn max_turns_per_session() -> usize {
     crate::proxy::config::get_thinking_max_memory_turns()
 }
 const MAX_BYTES_PER_SESSION: usize = 64 * 1024 * 1024;
+// This is an L1 cache budget, not a limit on persisted history or active requests.
+const MAX_TOTAL_MEMORY_BYTES: usize = 256 * 1024 * 1024;
+const MEMORY_IDLE_TTL: Duration = Duration::from_secs(10 * 60);
 /// Persist last_accessed at most this often. Fill/hydrate is memory-only between writes.
 const TOUCH_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
-
-fn idle_ttl() -> Duration {
-    let days = crate::proxy::config::get_thinking_retention_days().max(1) as u64;
-    Duration::from_secs(days.saturating_mul(24 * 60 * 60))
-}
 
 const PLACEHOLDER_THOUGHTS: &[&str] = &[
     "...",
@@ -96,22 +95,37 @@ struct SessionEntry {
     last_persist_touch: Instant,
     bytes: usize,
     l2_loaded: bool,
+    // Never reclaim state that failed to persist, or was modified while a save
+    // was in progress. Its only complete copy may still be in memory.
+    reloadable: bool,
+    generation: u64,
+    revision: u64,
 }
 
 impl SessionEntry {
     fn new() -> Self {
+        static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
         Self {
             turns: Vec::new(),
             last_access: Instant::now(),
             last_persist_touch: Instant::now(),
             bytes: 0,
             l2_loaded: false,
+            reloadable: false,
+            generation: NEXT_GENERATION.fetch_add(1, Ordering::Relaxed),
+            revision: 0,
         }
     }
 }
 
 pub struct ThinkingStore {
     sessions: DashMap<String, SessionEntry>,
+}
+
+struct ThinkingSnapshot {
+    turns: Vec<Arc<ThinkingRecord>>,
+    version: Option<(u64, u64)>,
+    complete: bool,
 }
 
 impl ThinkingStore {
@@ -127,23 +141,78 @@ impl ThinkingStore {
     }
 
     fn maybe_evict(&self, keep_key: &str) {
-        if self.sessions.len() <= MAX_SESSIONS {
+        self.reclaim_memory(keep_key, MAX_TOTAL_MEMORY_BYTES, MEMORY_IDLE_TTL);
+    }
+
+    /// Release only SQLite-backed L1 entries. Arc snapshots held by in-flight
+    /// requests remain valid, and the next request restores the full L2 history.
+    pub fn reclaim_idle_memory(&self) {
+        self.maybe_evict("");
+    }
+
+    fn reclaim_memory(&self, keep_key: &str, budget: usize, idle: Duration) {
+        self.sessions.retain(|key, entry| {
+            key == keep_key || !entry.reloadable || entry.last_access.elapsed() < idle
+        });
+        let mut bytes: usize = self.sessions.iter().map(|entry| entry.bytes).sum();
+        if self.sessions.len() <= MAX_SESSIONS && bytes <= budget {
             return;
         }
-        self.sessions
-            .retain(|_, e| e.last_access.elapsed() < idle_ttl());
-        if self.sessions.len() <= MAX_SESSIONS {
-            return;
-        }
-        if let Some(oldest_key) = self
+        let mut candidates: Vec<_> = self
             .sessions
             .iter()
-            .min_by_key(|e| e.last_access)
-            .map(|e| e.key().clone())
-        {
-            if oldest_key != keep_key {
-                self.sessions.remove(&oldest_key);
+            .filter(|entry| entry.key() != keep_key && entry.reloadable)
+            .map(|entry| {
+                (
+                    entry.key().clone(),
+                    entry.last_access,
+                    entry.generation,
+                    entry.revision,
+                )
+            })
+            .collect();
+        candidates.sort_unstable_by_key(|(_, last_access, _, _)| *last_access);
+        for (key, last_access, generation, revision) in candidates {
+            if self.sessions.len() <= MAX_SESSIONS && bytes <= budget {
+                break;
             }
+            // Recheck under the shard lock: a concurrent writer or request may
+            // have used this session after the candidate snapshot was taken.
+            if let Some((_, removed)) = self.sessions.remove_if(&key, |_, entry| {
+                entry.reloadable
+                    && entry.generation == generation
+                    && entry.revision == revision
+                    && entry.last_access == last_access
+            }) {
+                bytes = bytes.saturating_sub(removed.bytes);
+            }
+        }
+    }
+
+    fn trim_reloadable_entry(entry: &mut SessionEntry) {
+        if !entry.reloadable || entry.turns.is_empty() {
+            return;
+        }
+        // Keep at least the latest record, even if it alone exceeds the budget.
+        // Returning complete history to the current request is never truncated.
+        let mut keep_start = entry.turns.len() - 1;
+        let mut keep_bytes = record_bytes(&entry.turns[keep_start]);
+        let max_turns = max_turns_per_session().max(1);
+        while keep_start > 0 && entry.turns.len() - keep_start < max_turns {
+            let next_bytes = record_bytes(&entry.turns[keep_start - 1]);
+            if keep_bytes.saturating_add(next_bytes) > MAX_BYTES_PER_SESSION {
+                break;
+            }
+            keep_bytes += next_bytes;
+            keep_start -= 1;
+        }
+        if keep_start > 0 {
+            // One drain avoids quadratic front-removal when hydrating long L2
+            // histories. The returned request snapshot owns the removed Arcs.
+            drop(entry.turns.drain(..keep_start));
+            entry.turns.shrink_to_fit();
+            entry.bytes = keep_bytes;
+            entry.l2_loaded = false;
         }
     }
 
@@ -177,13 +246,17 @@ impl ThinkingStore {
             let _ = self.load_turns(store_key);
         }
 
-        let persist = {
+        let (persist, was_reloadable, generation, revision) = {
             let mut entry = self
                 .sessions
                 .entry(store_key.to_string())
                 .or_insert_with(SessionEntry::new);
             entry.last_access = Instant::now();
-            entry.l2_loaded = true;
+            let was_reloadable = entry.reloadable;
+            let generation = entry.generation;
+            entry.reloadable = false;
+            entry.revision = entry.revision.wrapping_add(1);
+            let revision = entry.revision;
 
             let merge_last = entry
                 .turns
@@ -197,7 +270,7 @@ impl ThinkingStore {
                         rec.thought.len() >= last.thought.len()
                             || rec.signature.as_ref().map(|s| s.len()).unwrap_or(0)
                                 > last.signature.as_ref().map(|s| s.len()).unwrap_or(0),
-                        last.thought.len() + last.visible.len(),
+                        record_bytes(last),
                     )
                 };
                 if stronger {
@@ -207,33 +280,30 @@ impl ThinkingStore {
                         *Arc::make_mut(last_arc) = rec;
                     }
                     entry.bytes = entry.bytes.saturating_add(rec_bytes);
-                    entry.turns.last().cloned()
+                    (
+                        entry.turns.last().cloned(),
+                        was_reloadable,
+                        generation,
+                        revision,
+                    )
                 } else {
-                    None
+                    entry.reloadable = was_reloadable;
+                    (None, was_reloadable, generation, revision)
                 }
             } else {
                 entry.turns.push(Arc::new(rec));
                 entry.bytes = entry.bytes.saturating_add(rec_bytes);
-                while entry.turns.len() > max_turns_per_session()
-                    || entry.bytes > MAX_BYTES_PER_SESSION
-                {
-                    if let Some(old) = entry.turns.first() {
-                        let old_bytes = old.thought.len()
-                            + old.signature.as_ref().map(|s| s.len()).unwrap_or(0)
-                            + old.visible.len();
-                        entry.bytes = entry.bytes.saturating_sub(old_bytes);
-                    }
-                    if entry.turns.is_empty() {
-                        break;
-                    }
-                    entry.turns.remove(0);
-                }
-                entry.turns.last().cloned()
+                (
+                    entry.turns.last().cloned(),
+                    was_reloadable,
+                    generation,
+                    revision,
+                )
             }
         };
 
         if let Some(saved) = persist {
-            let _ = crate::modules::proxy_db::save_thinking_record(
+            let result = crate::modules::proxy_db::save_thinking_record(
                 store_key,
                 &saved.fingerprint,
                 &saved.thought,
@@ -242,7 +312,21 @@ impl ThinkingStore {
                 &saved.tool_names,
                 &saved.visible,
             );
+            if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                if entry.generation == generation && entry.revision == revision {
+                    entry.reloadable = was_reloadable && result.is_ok();
+                    Self::trim_reloadable_entry(&mut entry);
+                }
+            }
+            if let Err(error) = result {
+                tracing::warn!(
+                    "[ThinkingStore] Keeping unpersisted session {} in RAM: {}",
+                    store_key,
+                    error
+                );
+            }
         }
+        self.maybe_evict(store_key);
     }
 
     /// Refresh in-memory expiry. SQLite last_accessed is debounced so HDD
@@ -265,59 +349,176 @@ impl ThinkingStore {
     }
 
     fn load_turns(&self, store_key: &str) -> Vec<Arc<ThinkingRecord>> {
-        if let Some(e) = self.sessions.get(store_key) {
+        self.load_turns_snapshot(store_key).turns
+    }
+
+    fn load_turns_snapshot(&self, store_key: &str) -> ThinkingSnapshot {
+        let observed_version = if let Some(e) = self.sessions.get(store_key) {
             // Trust warm non-empty memory. An empty l2_loaded entry is treated as
             // stale (e.g. first hydrate before any capture) and reloads from SQLite.
-            if e.l2_loaded && !e.turns.is_empty() {
+            if (e.l2_loaded || !e.reloadable) && !e.turns.is_empty() {
                 let turns = e.turns.clone();
+                let version = Some((e.generation, e.revision));
+                let complete = e.l2_loaded;
                 drop(e);
                 if let Some(mut entry) = self.sessions.get_mut(store_key) {
                     entry.last_access = Instant::now();
                 }
-                return turns;
+                return ThinkingSnapshot {
+                    turns,
+                    version,
+                    complete,
+                };
             }
-        }
+            Some((e.generation, e.revision))
+        } else {
+            None
+        };
 
-        let persisted =
-            crate::modules::proxy_db::load_thinking_records(store_key).unwrap_or_default();
+        let persisted = match crate::modules::proxy_db::load_thinking_records(store_key) {
+            Ok(records) => records,
+            Err(error) => {
+                tracing::warn!(
+                    "[ThinkingStore] Cannot restore session {} from SQLite: {}",
+                    store_key,
+                    error
+                );
+                return self
+                    .sessions
+                    .get(store_key)
+                    .map(|entry| ThinkingSnapshot {
+                        turns: entry.turns.clone(),
+                        version: Some((entry.generation, entry.revision)),
+                        complete: entry.l2_loaded,
+                    })
+                    .unwrap_or(ThinkingSnapshot {
+                        turns: Vec::new(),
+                        version: None,
+                        complete: false,
+                    });
+            }
+        };
         let loaded_len = persisted.len();
-        let mut entry = self
-            .sessions
-            .entry(store_key.to_string())
-            .or_insert_with(SessionEntry::new);
-        if entry.turns.is_empty() && !persisted.is_empty() {
-            for p in persisted {
-                let rec = ThinkingRecord {
+        let persisted_turns: Vec<_> = persisted
+            .into_iter()
+            .map(|p| {
+                Arc::new(ThinkingRecord {
                     fingerprint: p.fingerprint,
                     thought: p.thought,
                     signature: p.signature,
                     tool_ids: p.tool_ids,
                     tool_names: p.tool_names,
                     visible: p.visible,
+                })
+            })
+            .collect();
+        let (mut entry, is_new) = match self.sessions.entry(store_key.to_string()) {
+            dashmap::mapref::entry::Entry::Occupied(entry) => (entry.into_ref(), false),
+            dashmap::mapref::entry::Entry::Vacant(_) if observed_version.is_some() => {
+                // The original session was evicted or explicitly ended during
+                // the SQLite query. Its request snapshot can still be used,
+                // but must not recreate that removed cache entry.
+                return ThinkingSnapshot {
+                    turns: persisted_turns,
+                    version: None,
+                    complete: true,
                 };
-                entry.bytes += record_bytes(&rec);
-                entry.turns.push(Arc::new(rec));
             }
+            dashmap::mapref::entry::Entry::Vacant(entry) => {
+                (entry.insert(SessionEntry::new()), true)
+            }
+        };
+        let mut concurrent_snapshot = None;
+        let mut complete = true;
+        if !Self::can_install_reload(observed_version, &entry, is_new) {
+            // SQLite was read without the shard lock. A capture/prune may have
+            // completed meanwhile; never replace that authoritative newer L1.
+            // Merge a request view with its newer tail. A concurrent partial
+            // tail may leave middle turns absent, so ingest must not treat this
+            // view as a complete history snapshot.
+            concurrent_snapshot = Some(if entry.l2_loaded || entry.turns.is_empty() {
+                entry.turns.clone()
+            } else {
+                Self::merge_reload_snapshot(persisted_turns, &entry.turns)
+            });
+            // A stale L2 query plus a newer partial tail may omit the middle
+            // of an arbitrarily long concurrent append. It is not a full view.
+            complete = entry.l2_loaded;
+        } else if entry.turns.is_empty() || entry.reloadable {
+            entry.turns = persisted_turns;
+            entry.bytes = entry.turns.iter().map(|record| record_bytes(record)).sum();
             tracing::info!(
                 "[ThinkingStore] Restored {} turns from SQLite L2 for session {}",
                 entry.turns.len(),
                 store_key
             );
+            entry.reloadable = true;
+            entry.l2_loaded = true;
+            entry.revision = entry.revision.wrapping_add(1);
         }
-        entry.l2_loaded = true;
         entry.last_access = Instant::now();
         entry.last_persist_touch = Instant::now();
-        let turns = entry.turns.clone();
+        let stale_partial = concurrent_snapshot.is_some() && !complete;
+        let turns = concurrent_snapshot.unwrap_or_else(|| entry.turns.clone());
+        Self::trim_reloadable_entry(&mut entry);
+        let version = if stale_partial {
+            observed_version
+        } else {
+            Some((entry.generation, entry.revision))
+        };
         drop(entry);
         if loaded_len > 0 {
             let _ = crate::modules::proxy_db::touch_thinking_session(store_key);
         }
-        turns
+        self.maybe_evict(store_key);
+        ThinkingSnapshot {
+            turns,
+            version,
+            complete,
+        }
+    }
+
+    fn can_install_reload(
+        observed: Option<(u64, u64)>,
+        entry: &SessionEntry,
+        is_new: bool,
+    ) -> bool {
+        is_new || observed == Some((entry.generation, entry.revision))
+    }
+
+    fn merge_reload_snapshot(
+        mut persisted: Vec<Arc<ThinkingRecord>>,
+        current: &[Arc<ThinkingRecord>],
+    ) -> Vec<Arc<ThinkingRecord>> {
+        let overlap = (1..=persisted.len().min(current.len()))
+            .rev()
+            .find(|&count| {
+                persisted[persisted.len() - count..]
+                    .iter()
+                    .zip(&current[..count])
+                    .all(|(old, new)| old.fingerprint == new.fingerprint)
+            })
+            .unwrap_or(0);
+        let start = persisted.len() - overlap;
+        for (index, record) in current[..overlap].iter().enumerate() {
+            persisted[start + index] = record.clone();
+        }
+        persisted.extend(current[overlap..].iter().cloned());
+        persisted
     }
 
     /// Capture real thinking from the inbound request without re-appending
     /// history that is already stored. Placeholder blocks are ignored.
     pub fn ingest_from_contents(&self, store_key: &str, contents: &[Value]) {
+        self.ingest_from_contents_with_snapshot_hook(store_key, contents, || {});
+    }
+
+    fn ingest_from_contents_with_snapshot_hook(
+        &self,
+        store_key: &str,
+        contents: &[Value],
+        mut after_snapshot: impl FnMut(),
+    ) {
         if !crate::proxy::config::is_thinking_store_enabled() || store_key.is_empty() {
             return;
         }
@@ -350,54 +551,100 @@ impl ThinkingStore {
             return;
         }
 
-        let existing = self.load_turns(store_key);
-        let mut used = vec![false; existing.len()];
-        let mut to_append = Vec::new();
-        let mut to_upgrade: Vec<(usize, ThinkingRecord)> = Vec::new();
+        loop {
+            let snapshot = self.load_turns_snapshot(store_key);
+            let existing = &snapshot.turns;
+            after_snapshot();
+            let mut used = vec![false; existing.len()];
+            let mut to_append = Vec::new();
+            let mut to_upgrade: Vec<(usize, ThinkingRecord)> = Vec::new();
 
-        for rec in incoming {
-            if let Some(idx) = match_existing_record(&rec, &existing, &used) {
-                used[idx] = true;
-                if is_stronger_record(&rec, &existing[idx]) {
-                    to_upgrade.push((idx, rec));
+            for rec in &incoming {
+                if let Some(idx) = match_existing_record(rec, existing, &used) {
+                    used[idx] = true;
+                    if is_stronger_record(&rec, &existing[idx]) {
+                        to_upgrade.push((idx, rec.clone()));
+                    }
+                } else {
+                    to_append.push(rec.clone());
                 }
-            } else {
-                to_append.push(rec);
             }
-        }
 
-        if !to_upgrade.is_empty() {
-            if let Some(mut entry) = self.sessions.get_mut(store_key) {
-                for (idx, rec) in &to_upgrade {
-                    if *idx >= entry.turns.len() {
+            if !to_upgrade.is_empty() {
+                let mut persistence_state = None;
+                if let Some(mut entry) = self.sessions.get_mut(store_key) {
+                    if snapshot.version != Some((entry.generation, entry.revision)) {
+                        drop(entry);
+                        std::thread::yield_now();
                         continue;
                     }
-                    let new_bytes = record_bytes(rec);
-                    let old_bytes = record_bytes(&entry.turns[*idx]);
-                    entry.bytes = entry
-                        .bytes
-                        .saturating_sub(old_bytes)
-                        .saturating_add(new_bytes);
-                    *Arc::make_mut(&mut entry.turns[*idx]) = rec.clone();
+                    // Historical client upgrades are not written by the append-only
+                    // L2 path. Restore the full snapshot before applying them so a
+                    // trimmed-out older turn's stronger thought is still preserved.
+                    if !entry.l2_loaded && entry.reloadable && snapshot.complete {
+                        entry.turns = existing.clone();
+                        entry.bytes = entry.turns.iter().map(|record| record_bytes(record)).sum();
+                        entry.l2_loaded = true;
+                    }
+                    let was_reloadable = entry.reloadable;
+                    entry.reloadable = false;
+                    entry.revision = entry.revision.wrapping_add(1);
+                    persistence_state = Some((was_reloadable, entry.generation, entry.revision));
+                    for (idx, rec) in &to_upgrade {
+                        // load_turns may return all L2 records while L1 retains only
+                        // a bounded tail. Locate its shared Arc instead of assuming
+                        // that the L1 and full-history indices are identical.
+                        let Some(memory_idx) = entry
+                            .turns
+                            .iter()
+                            .position(|cached| Arc::ptr_eq(cached, &existing[*idx]))
+                        else {
+                            continue;
+                        };
+                        let new_bytes = record_bytes(rec);
+                        let old_bytes = record_bytes(&entry.turns[memory_idx]);
+                        entry.bytes = entry
+                            .bytes
+                            .saturating_sub(old_bytes)
+                            .saturating_add(new_bytes);
+                        *Arc::make_mut(&mut entry.turns[memory_idx]) = rec.clone();
+                    }
+                } else {
+                    // Eviction/end_session removed the snapshot's generation. Read
+                    // the current session instead of installing the removed view.
+                    std::thread::yield_now();
+                    continue;
+                }
+                if let Some((idx, rec)) = to_upgrade.last() {
+                    if *idx + 1 == existing.len() {
+                        let result = crate::modules::proxy_db::save_thinking_record(
+                            store_key,
+                            &rec.fingerprint,
+                            &rec.thought,
+                            rec.signature.as_deref(),
+                            &rec.tool_ids,
+                            &rec.tool_names,
+                            &rec.visible,
+                        );
+                        if to_upgrade.len() == 1 {
+                            if let (Some((was_reloadable, generation, revision)), Some(mut entry)) =
+                                (persistence_state, self.sessions.get_mut(store_key))
+                            {
+                                if entry.generation == generation && entry.revision == revision {
+                                    entry.reloadable = was_reloadable && result.is_ok();
+                                    Self::trim_reloadable_entry(&mut entry);
+                                }
+                            }
+                        }
+                    }
                 }
             }
-            if let Some((idx, rec)) = to_upgrade.last() {
-                if *idx + 1 == existing.len() {
-                    let _ = crate::modules::proxy_db::save_thinking_record(
-                        store_key,
-                        &rec.fingerprint,
-                        &rec.thought,
-                        rec.signature.as_deref(),
-                        &rec.tool_ids,
-                        &rec.tool_names,
-                        &rec.visible,
-                    );
-                }
-            }
-        }
 
-        for rec in to_append {
-            self.record(store_key, rec);
+            for rec in to_append {
+                self.record(store_key, rec);
+            }
+            self.maybe_evict(store_key);
+            break;
         }
     }
 
@@ -758,6 +1005,7 @@ impl ThinkingStore {
                 if let Some(mut entry) = self.sessions.get_mut(store_key) {
                     entry.bytes = entry.bytes.saturating_add(record_bytes(&rec_arc));
                     entry.turns.push(rec_arc);
+                    Self::trim_reloadable_entry(&mut entry);
                 }
             }
         }
@@ -953,6 +1201,7 @@ impl ThinkingStore {
                 store_key
             );
         }
+        self.maybe_evict(store_key);
         restored
     }
 
@@ -981,9 +1230,14 @@ impl ThinkingStore {
         }
 
         let mut purged_count = 0;
+        let mut persistence_state = None;
 
         // 1. 精准净化内存缓存 (RAM)
         if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            let was_reloadable = entry.reloadable;
+            entry.reloadable = false;
+            entry.revision = entry.revision.wrapping_add(1);
+            persistence_state = Some((was_reloadable, entry.generation, entry.revision));
             let mut new_turns = Vec::with_capacity(entry.turns.len());
             for rec in &entry.turns {
                 if let Some(ref sig) = rec.signature {
@@ -1005,13 +1259,21 @@ impl ThinkingStore {
                 new_turns.push(rec.clone());
             }
             entry.turns = new_turns;
+            entry.bytes = entry.turns.iter().map(|record| record_bytes(record)).sum();
         }
 
         // 2. 精准净化持久化数据库 (SQLite)
-        let _ = crate::modules::proxy_db::purge_foreign_signatures_for_session_with_model(
+        let result = crate::modules::proxy_db::purge_foreign_signatures_for_session_with_model(
             store_key,
             target_model,
         );
+        if let (Some((was_reloadable, generation, revision)), Some(mut entry)) =
+            (persistence_state, self.sessions.get_mut(store_key))
+        {
+            if entry.generation == generation && entry.revision == revision {
+                entry.reloadable = was_reloadable && result.is_ok();
+            }
+        }
 
         if purged_count > 0 {
             tracing::warn!(
@@ -1029,11 +1291,16 @@ impl ThinkingStore {
             return;
         }
 
-        let mem_turns = self
-            .sessions
-            .get(store_key)
-            .map(|e| e.turns.len())
-            .unwrap_or(0);
+        let mem_turns = if let Some(entry) = self.sessions.get(store_key) {
+            // An L1 tail cannot decide which full-history L2 rows are orphans.
+            // Deleting from this partial view would erase still-live old turns.
+            if !entry.l2_loaded {
+                return;
+            }
+            entry.turns.len()
+        } else {
+            0
+        };
         if mem_turns == 0 {
             return;
         }
@@ -1082,11 +1349,13 @@ impl ThinkingStore {
             }
         }
 
-        let keep_fps = {
+        let (keep_fps, was_reloadable, generation, revision) = {
             let Some(mut entry) = self.sessions.get_mut(store_key) else {
                 return;
             };
-            if entry.turns.len() <= live_turn_count.saturating_add(2) {
+            // The first read guard was released before scanning contents. A
+            // concurrent capture may have trimmed L1 to a partial tail since.
+            if !entry.l2_loaded || entry.turns.len() <= live_turn_count.saturating_add(2) {
                 return;
             }
 
@@ -1124,18 +1393,28 @@ impl ThinkingStore {
             entry.bytes = keep.iter().map(|r| record_bytes(r)).sum();
             let fps: Vec<String> = keep.iter().map(|r| r.fingerprint.clone()).collect();
             entry.turns = keep;
+            // A failed SQLite prune must not resurrect removed history after
+            // eviction. Keep this session resident until its state is recoverable.
+            let was_reloadable = entry.reloadable;
+            entry.reloadable = false;
+            entry.revision = entry.revision.wrapping_add(1);
             tracing::info!(
                 "[ThinkingStore] Pruned {} orphaned thinking record(s) after context compression for session {}",
                 dropped,
                 store_key
             );
-            fps
+            (fps, was_reloadable, entry.generation, entry.revision)
         };
 
         // Delete orphans by fingerprint. Never DELETE+re-INSERT the kept blobs.
-        let _ = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
+        let result = crate::modules::proxy_db::delete_thinking_records_except_fingerprints(
             store_key, &keep_fps,
         );
+        if let Some(mut entry) = self.sessions.get_mut(store_key) {
+            if entry.generation == generation && entry.revision == revision {
+                entry.reloadable = was_reloadable && result.is_ok();
+            }
+        }
     }
 
     pub fn session_stats(&self, store_key: &str) -> Option<(usize, usize)> {
@@ -2415,7 +2694,15 @@ fn is_capturable_thought(thought: &str, signature: Option<&str>) -> bool {
 }
 
 fn record_bytes(rec: &ThinkingRecord) -> usize {
-    rec.thought.len() + rec.signature.as_ref().map(|s| s.len()).unwrap_or(0) + rec.visible.len()
+    std::mem::size_of::<ThinkingRecord>()
+        + rec.fingerprint.capacity()
+        + rec.thought.capacity()
+        + rec.signature.as_ref().map(|s| s.capacity()).unwrap_or(0)
+        + rec.visible.capacity()
+        + rec.tool_ids.capacity() * std::mem::size_of::<String>()
+        + rec.tool_ids.iter().map(|s| s.capacity()).sum::<usize>()
+        + rec.tool_names.capacity() * std::mem::size_of::<String>()
+        + rec.tool_names.iter().map(|s| s.capacity()).sum::<usize>()
 }
 
 fn is_stronger_record(new: &ThinkingRecord, old: &ThinkingRecord) -> bool {
@@ -2732,6 +3019,286 @@ pub fn fingerprint(visible: &str, tool_ids: &[String], tool_names: &[String]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_reclamation_ingest_snapshot_conflict_preserves_appended_trimmed_history() {
+        use std::sync::{atomic::AtomicUsize, mpsc};
+
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-ingest-append-trim";
+        let target_id = "call_ingest_snapshot_target";
+        let limit = max_turns_per_session();
+        store.record(
+            key,
+            rec("original thought", "target reply", Some(target_id)),
+        );
+        for i in 1..limit {
+            store.record(
+                key,
+                rec(&format!("thought {i}"), &format!("reply {i}"), None),
+            );
+        }
+        let full_thought = "complete historical thought and tool reasoning".repeat(20);
+        let full_signature = "updated-signature".repeat(20);
+        let contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "thought": true, "text": full_thought, "thoughtSignature": full_signature },
+                { "text": "target reply" },
+                { "functionCall": { "name": "shell", "id": target_id, "args": {} } }
+            ]
+        })];
+        let appended = rec("concurrent new thought", "concurrent new reply", None);
+        let appended_fp = appended.fingerprint.clone();
+        let appended_signature = appended.signature.clone();
+        let attempts = AtomicUsize::new(0);
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        std::thread::scope(|scope| {
+            let store_ref = &store;
+            let contents_ref = &contents;
+            let attempts_ref = &attempts;
+            let worker = scope.spawn(move || {
+                let mut first = true;
+                store_ref.ingest_from_contents_with_snapshot_hook(key, contents_ref, || {
+                    attempts_ref.fetch_add(1, Ordering::SeqCst);
+                    if first {
+                        first = false;
+                        ready_tx.send(()).unwrap();
+                        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+                    }
+                });
+            });
+            ready_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+            // This real capture advances the version and evicts the target from
+            // the L1 tail while A still owns the old complete snapshot.
+            store.record(key, appended);
+            let was_trimmed = {
+                let entry = store.sessions.get(key).unwrap();
+                !entry.l2_loaded && entry.turns.len() == limit
+            };
+            resume_tx.send(()).unwrap();
+            worker.join().unwrap();
+            assert!(was_trimmed);
+        });
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        let turns = store.load_turns(key);
+        assert_eq!(
+            turns.len(),
+            limit + 1,
+            "all old and concurrently appended turns survive"
+        );
+        let upgraded = turns
+            .iter()
+            .find(|record| record.tool_ids.iter().any(|id| id == target_id))
+            .unwrap();
+        assert_eq!(upgraded.thought, full_thought);
+        assert_eq!(upgraded.signature.as_deref(), Some(full_signature.as_str()));
+        let newest = turns
+            .iter()
+            .find(|record| record.fingerprint == appended_fp)
+            .unwrap();
+        assert_eq!(newest.thought, "concurrent new thought");
+        assert_eq!(newest.signature, appended_signature);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(key)
+                .unwrap()
+                .len(),
+            limit + 1
+        );
+        store.reclaim_memory("", 0, Duration::ZERO);
+        assert_eq!(
+            store.load_turns(key).len(),
+            limit + 1,
+            "unpersisted historical upgrades remain protected"
+        );
+        store.end_session(key);
+    }
+
+    #[test]
+    fn memory_reclamation_ingest_sqlite_failure_keeps_partial_l1_without_retry_or_complete_flag() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-ingest-failed-l2";
+        let target_id = "call_ingest_failed_l2";
+        store.record(key, rec("old history", "old reply", None));
+        store.record(key, rec("partial thought", "target reply", Some(target_id)));
+        {
+            let mut entry = store.sessions.get_mut(key).unwrap();
+            entry.turns.remove(0);
+            entry.bytes = entry.turns.iter().map(|record| record_bytes(record)).sum();
+            entry.l2_loaded = false;
+        }
+        let full_thought = "complete thought retained during SQLite failure";
+        let full_signature = "failed-l2-complete-signature".repeat(8);
+        let contents = vec![json!({
+            "role": "model",
+            "parts": [
+                { "thought": true, "text": full_thought, "thoughtSignature": full_signature },
+                { "text": "target reply" },
+                { "functionCall": { "name": "shell", "id": target_id, "args": {} } }
+            ]
+        })];
+        {
+            let _failed_dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+            std::fs::create_dir_all(crate::modules::proxy_db::get_thinking_db_path().unwrap())
+                .unwrap();
+            let mut snapshots = 0;
+            store.ingest_from_contents_with_snapshot_hook(key, &contents, || {
+                snapshots += 1;
+                assert_eq!(snapshots, 1, "SQL failure alone must not retry the request");
+            });
+            assert_eq!(snapshots, 1);
+            let entry = store.sessions.get(key).unwrap();
+            assert!(
+                !entry.l2_loaded,
+                "a partial fallback is never marked complete"
+            );
+            assert!(
+                !entry.reloadable,
+                "the stronger unpersisted thought stays protected"
+            );
+            assert_eq!(entry.turns[0].thought, full_thought);
+            assert_eq!(
+                entry.turns[0].signature.as_deref(),
+                Some(full_signature.as_str())
+            );
+        }
+        store.reclaim_memory("", 0, Duration::ZERO);
+        let turns = store.load_turns(key);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].thought, full_thought);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(key)
+                .unwrap()
+                .len(),
+            2
+        );
+        store.end_session(key);
+    }
+
+    #[test]
+    fn memory_reclamation_restores_complete_sqlite_history_and_keeps_active_snapshot() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-full-history";
+        let thought = "完整思考与工具参数".repeat(10_000);
+        store.record(key, rec(&thought, "first reply", None));
+        store.record(
+            key,
+            rec("second thought", "tool reply", Some("call_reclaim_1")),
+        );
+        let active = store.load_turns(key);
+        assert!(store.sessions.get(key).unwrap().reloadable);
+        store.reclaim_memory("", 0, Duration::MAX);
+        assert!(store.session_stats(key).is_none());
+        assert_eq!(
+            active[0].thought, thought,
+            "in-flight Arc snapshots stay valid"
+        );
+        let restored = store.load_turns(key);
+        assert_eq!(restored.len(), 2);
+        assert_eq!(restored[0].thought, active[0].thought);
+        assert_eq!(restored[0].signature, active[0].signature);
+        assert_eq!(restored[1].tool_ids, active[1].tool_ids);
+        assert_eq!(restored[1].thought, active[1].thought);
+        store.end_session(key);
+    }
+
+    #[test]
+    fn memory_reclamation_keeps_unpersisted_records_on_sqlite_failure() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let db_path = crate::modules::proxy_db::get_thinking_db_path().unwrap();
+        std::fs::create_dir_all(db_path).unwrap();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-failed-save";
+        store.record(key, rec("only complete copy stays in RAM", "reply", None));
+        assert!(!store.sessions.get(key).unwrap().reloadable);
+        store.reclaim_memory("", 0, Duration::ZERO);
+        let turns = store.load_turns(key);
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].thought, "only complete copy stays in RAM");
+    }
+
+    #[test]
+    fn memory_reclamation_tail_never_prunes_full_sqlite_history() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-partial-l1";
+        for i in 0..6 {
+            store.record(
+                key,
+                rec(&format!("thought {i}"), &format!("reply {i}"), None),
+            );
+        }
+        {
+            let mut entry = store.sessions.get_mut(key).unwrap();
+            entry.turns.remove(0);
+            entry.bytes = entry.turns.iter().map(|r| record_bytes(r)).sum();
+            entry.l2_loaded = false;
+        }
+        store.prune_orphaned_records(key, &[]);
+        assert_eq!(
+            crate::modules::proxy_db::load_thinking_records(key)
+                .unwrap()
+                .len(),
+            6
+        );
+        let full = store.load_turns(key);
+        assert_eq!(full.len(), 6);
+        assert_eq!(full[0].thought, "thought 0");
+        store.end_session(key);
+    }
+
+    #[test]
+    fn memory_reclamation_merge_accounting_does_not_accumulate_signature_bytes() {
+        let _dir = crate::proxy::monitor::prompt_log_tests::TestDataDir::new();
+        let store = ThinkingStore::new();
+        let key = "memory-reclamation-merge-accounting";
+        for _ in 0..50 {
+            store.record(key, rec("same thought", "same reply", None));
+        }
+        let entry = store.sessions.get(key).unwrap();
+        assert_eq!(entry.turns.len(), 1);
+        assert_eq!(entry.bytes, record_bytes(&entry.turns[0]));
+        drop(entry);
+        store.end_session(key);
+    }
+
+    #[test]
+    fn memory_reclamation_stale_reload_snapshot_keeps_concurrent_upgrade_and_append() {
+        let first = Arc::new(rec("first thought", "reply 1", None));
+        let second = Arc::new(rec("partial", "reply 2", None));
+        let upgraded = Arc::new(rec("complete second thought", "reply 2", None));
+        let third = Arc::new(rec("concurrently captured", "reply 3", None));
+        let merged = ThinkingStore::merge_reload_snapshot(
+            vec![first.clone(), second],
+            &[upgraded.clone(), third.clone()],
+        );
+        assert_eq!(merged.len(), 3);
+        assert!(Arc::ptr_eq(&merged[0], &first));
+        assert!(Arc::ptr_eq(&merged[1], &upgraded));
+        assert!(Arc::ptr_eq(&merged[2], &third));
+    }
+
+    #[test]
+    fn memory_reclamation_reload_guard_prevents_pruned_empty_and_recreated_session_resurrection() {
+        let mut entry = SessionEntry::new();
+        let observed = Some((entry.generation, entry.revision));
+        entry
+            .turns
+            .push(Arc::new(rec("old thought", "old reply", None)));
+        entry.turns.clear();
+        entry.revision += 1;
+        assert!(!ThinkingStore::can_install_reload(observed, &entry, false));
+        let recreated = SessionEntry::new();
+        assert_ne!(recreated.generation, entry.generation);
+        assert!(!ThinkingStore::can_install_reload(
+            observed, &recreated, false
+        ));
+        assert!(ThinkingStore::can_install_reload(None, &recreated, true));
+    }
 
     fn rec(thought: &str, visible: &str, tool_id: Option<&str>) -> ThinkingRecord {
         let tool_ids = tool_id.map(|id| vec![id.to_string()]).unwrap_or_default();

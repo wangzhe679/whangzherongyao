@@ -87,6 +87,7 @@ pub struct StreamingState {
     pub estimated_prompt_tokens: Option<u32>,
     // [FIX #859] Post-thinking interruption tracking
     pub has_thinking: bool,
+    pub show_thoughts: bool,
     pub has_content: bool,
     pub message_count: usize, // [NEW v4.0.0] Message count for rewind detection
     pub client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [FIX] Remove Box, use Arc<dyn> directly
@@ -120,6 +121,7 @@ impl StreamingState {
             in_mcp_xml: false,
             estimated_prompt_tokens: None,
             has_thinking: false,
+            show_thoughts: true,
             has_content: false,
             message_count: 0,
             client_adapter: None,
@@ -437,7 +439,9 @@ impl StreamingState {
 
     /// 设置 trailing signature
     pub fn set_trailing_signature(&mut self, signature: Option<String>) {
-        self.trailing_signature = signature;
+        if self.show_thoughts {
+            self.trailing_signature = signature;
+        }
     }
 
     /// 获取 trailing signature (仅用于检查)
@@ -600,6 +604,23 @@ impl<'a> PartProcessor<'a> {
     /// 处理 Thinking
     fn process_thinking(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
+        if !self.state.show_thoughts {
+            // The stream's TurnAccumulator has already captured this part.
+            // Cache the real signature without opening any client thinking block.
+            if let Some(sig) = signature {
+                if let Some(model) = &self.state.model_name {
+                    SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
+                }
+                if let Some(session_id) = &self.state.session_id {
+                    SignatureCache::global().cache_session_signature(
+                        session_id,
+                        sig,
+                        self.state.message_count,
+                    );
+                }
+            }
+            return chunks;
+        }
 
         // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {

@@ -2,7 +2,6 @@ import { createBrowserRouter, RouterProvider } from 'react-router-dom';
 
 import Layout from './components/layout/Layout';
 import Dashboard from './pages/Dashboard';
-import ModelLocks from './pages/ModelLocks';
 import Accounts from './pages/Accounts';
 import Settings from './pages/Settings';
 import ApiProxy from './pages/ApiProxy';
@@ -29,7 +28,6 @@ const router = createBrowserRouter([
     path: '/',
     element: <Layout />,
     children: [
-      { path: 'model-locks', element: <ModelLocks /> },
       {
         index: true,
         element: <Dashboard />,
