@@ -1,0 +1,54 @@
+name: Build Docker Linux AMD64
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine tag name
+        id: tag
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VER="${GITHUB_REF#refs/tags/}"
+          else
+            VER="v4.9.8-beta.3-custom"
+          fi
+          echo "ver=$VER" >> "$GITHUB_OUTPUT"
+          echo "Building tag: $VER"
+
+      - name: Build Docker image (AMD64)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: antigravity-manager:${{ steps.tag.outputs.ver }}
+          build-args: |
+            USE_MIRROR=false
+
+      - name: Export image as tar.gz
+        run: |
+          TAG="${{ steps.tag.outputs.ver }}"
+          docker save "antigravity-manager:${TAG}" | gzip > "antigravity-manager-${TAG}.tar.gz"
+          ls -lh "antigravity-manager-${TAG}.tar.gz"
+          sha256sum "antigravity-manager-${TAG}.tar.gz"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: antigravity-manager-docker-linux-amd64
+          path: antigravity-manager-*.tar.gz
+          retention-days: 30
