@@ -15,10 +15,11 @@ COPY package*.json ./
 RUN --mount=type=cache,target=/root/.npm \
     npm ci --legacy-peer-deps --prefer-offline --no-audit --no-fund
 COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.config.cjs index.html ./
+COPY dev-mock.ts _fix_mock.mjs ./
 COPY public ./public
 COPY src ./src
 COPY src-tauri/icons ./src-tauri/icons
-RUN npx vite build
+RUN npm run build
 
 # --- Backend Build Stage ---
 FROM rust:1-slim-bookworm AS backend-builder

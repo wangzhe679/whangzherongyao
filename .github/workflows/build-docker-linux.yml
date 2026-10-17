@@ -29,6 +29,8 @@ jobs:
 
       - name: Build Docker image (AMD64)
         uses: docker/build-push-action@v6
+        id: docker_build
+        continue-on-error: true
         with:
           context: .
           file: docker/Dockerfile
@@ -38,7 +40,31 @@ jobs:
           build-args: |
             USE_MIRROR=false
 
+      - name: Save build log on failure
+        if: steps.docker_build.outcome == 'failure'
+        run: |
+          echo "Docker build failed. Dumping buildx logs..." > build-error.txt
+          echo "=== docker buildx du ===" >> build-error.txt
+          docker buildx du 2>&1 >> build-error.txt || true
+          echo "=== docker system info ===" >> build-error.txt
+          docker system info 2>&1 >> build-error.txt || true
+          echo "=== Attempting build without cache for full log ===" >> build-error.txt
+          docker build --no-cache --progress=plain -f docker/Dockerfile -t test-build . 2>&1 | tail -200 >> build-error.txt || true
+
+      - name: Upload error log
+        if: steps.docker_build.outcome == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-error-log
+          path: build-error.txt
+          retention-days: 7
+
+      - name: Fail if build failed
+        if: steps.docker_build.outcome == 'failure'
+        run: exit 1
+
       - name: Export image as tar.gz
+        if: steps.docker_build.outcome == 'success'
         run: |
           TAG="${{ steps.tag.outputs.ver }}"
           docker save "antigravity-manager:${TAG}" | gzip > "antigravity-manager-${TAG}.tar.gz"
