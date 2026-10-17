@@ -18,7 +18,7 @@ COPY tsconfig.json tsconfig.node.json vite.config.ts tailwind.config.js postcss.
 COPY public ./public
 COPY src ./src
 COPY src-tauri/icons ./src-tauri/icons
-RUN npm run build
+RUN npx vite build
 
 # --- Backend Build Stage ---
 FROM rust:1-slim-bookworm AS backend-builder
