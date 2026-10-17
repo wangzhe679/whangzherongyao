@@ -32,7 +32,6 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64
           push: false
           load: true
           tags: antigravity-manager:${{ steps.tag.outputs.ver }}
