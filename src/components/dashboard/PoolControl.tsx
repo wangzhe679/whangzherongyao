@@ -6,7 +6,7 @@ import { AppConfig } from '../../types/config';
 import { formatCompactDuration } from '../../utils/liveLimit';
 
 export type ModelLock = { model: string; until: number; detected_at: number; status: number; lock_type: string; transient_count: number; reason: string; message: string };
-type LockStatistics = { locked: number; true_429: number; fake_429: number; short_locks: number; expires_in_days: number[]; over_six_days: number; earliest_until?: number | null; latest_until?: number | null };
+type LockStatistics = { locked: number; true_429: number; short_locks: number; expires_in_days: number[]; over_six_days: number; earliest_until?: number | null; latest_until?: number | null };
 export type PoolStatus = {
     loaded_count: number; available_count: number; locked_account_count: number; locked_model_count: number;
     models: { model: string; loaded: number; available: number; locked: number; lock_stats?: LockStatistics }[];
@@ -27,7 +27,7 @@ function LockCounts({ stats, now }: { stats?: LockStatistics; now: number }) {
     const latest = stats.latest_until;
     const title = earliest && latest ? `最早到期：${new Date(earliest * 1000).toLocaleString()}；最晚到期：${new Date(latest * 1000).toLocaleString()}` : undefined;
     return <div className="text-xs whitespace-nowrap" title={title}>
-        <p><span className={stats.true_429 ? 'text-orange-600' : 'text-gray-400'}>真429 {stats.true_429}</span><span className="mx-2 text-gray-400">/</span><span className={stats.fake_429 ? 'text-red-600' : 'text-gray-400'}>假429/503 {stats.fake_429}</span><span className="mx-2 text-gray-400">/</span><span className={stats.short_locks ? 'text-amber-600' : 'text-gray-400'}>其他短锁 {stats.short_locks}</span></p>
+        <p><span className={stats.true_429 ? 'text-orange-600' : 'text-gray-400'}>真429 {stats.true_429}</span><span className="mx-2 text-gray-400">/</span><span className={stats.short_locks ? 'text-amber-600' : 'text-gray-400'}>短锁(含503) {stats.short_locks}</span></p>
         <p className="mt-1 text-gray-500 tabular-nums">{earliest && latest ? `到期 ${formatLockRemaining(earliest, now)}${latest !== earliest ? ` ～ ${formatLockRemaining(latest, now)}` : ''}` : '无活动锁'}</p>
     </div>;
 }
@@ -127,7 +127,7 @@ export default function PoolControl() {
                 </tr>)}</tbody>
             </table>
             {!status && <p className="p-3 text-sm text-gray-500">正在读取模型状态…</p>}
-            {status && <p className="px-3 py-2 text-xs text-gray-500 border-t border-gray-100 dark:border-base-300">短锁含假429与503；全部锁含未加载账号。1d 表示24小时内，2d 表示24–48小时，依此类推。按当前有效锁统计，不提前解锁。</p>}
+            {status && <p className="px-3 py-2 text-xs text-gray-500 border-t border-gray-100 dark:border-base-300">短锁含503及普通429；全部锁含未加载账号。1d 表示24小时内，2d 表示24–48小时，依此类推。按当前有效锁统计，不提前解锁。</p>}
         </div>
         {status?.locked_accounts?.length ? <details className={box}>
             <summary className="p-3 cursor-pointer text-sm font-medium">挂锁账号明细（{status.locked_account_count} 个）</summary>
@@ -139,7 +139,7 @@ export default function PoolControl() {
                     </div>
                     <div className="mt-1 flex flex-wrap gap-x-3 gap-y-1">
                         {Object.values(account.locks).map(lock => <span key={`${account.account_id}:${lock.model}`} className="font-mono text-orange-600" title={lock.message}>
-                            {lock.model} · {lock.lock_type === 'exact' ? '真429' : lock.status === 503 ? '假429/503' : '短锁'} · {formatLockRemaining(lock.until, status.server_time)}
+                            {lock.model} · {lock.lock_type === 'exact' ? '真429' : '短锁'} · {formatLockRemaining(lock.until, status.server_time)}
                         </span>)}
                     </div>
                 </div>)}

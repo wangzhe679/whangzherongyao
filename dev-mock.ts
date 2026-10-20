@@ -123,7 +123,60 @@ const MOCK_ACCOUNTS = [
     },
     live_limited_models: {},
   },
-];
+  {
+    id: 'acc-006', email: 'frank.ultra@gmail.com', name: 'Frank', priority: 6,
+    custom_label: 'Ultra', disabled: false, proxy_disabled: false,
+    created_at: now - 20*24*hour, last_used: now - 10*60_000,
+    token: { access_token:'at-006', refresh_token:'rt-006', expires_in:3600, expiry_timestamp: now+hour, token_type:'Bearer', email:'frank.ultra@gmail.com' },
+    quota: {
+      models: [
+        { name:'claude-sonnet-4-6', percentage:55, reset_time:'4h 0m', display_name:'Claude Sonnet 4', supports_thinking:true },
+        { name:'claude-opus-4-6-thinking', percentage:38, reset_time:'3h 20m', display_name:'Claude Opus 4.6 Thinking', supports_thinking:true },
+        { name:'gemini-3.8-flash-tiered', percentage:92, reset_time:'1h 10m', display_name:'Gemini 3.8 Flash' },
+        { name:'gemini-4-argon', percentage:100, reset_time:'0m', display_name:'Gemini 4 Argon' },
+        { name:'gemini-3.1-flash-lite', percentage:75, reset_time:'2h 30m', display_name:'Gemini 3.1 Flash Lite' },
+      ],
+      last_updated: now - 45_000, subscription_tier: 'GDP_HELIUM',
+      quota_groups: [
+        { display_name:'Gemini Models', buckets:[
+          { bucket_id:'gem-w', window:'weekly', remaining_fraction:0.92, reset_time:'6d 0h', cycle_tokens:200000 },
+          { bucket_id:'gem-5', window:'5h', remaining_fraction:0.88, reset_time:'1h 10m', cycle_tokens:55000 },
+        ]},
+        { display_name:'Claude models', buckets:[
+          { bucket_id:'cg-w', window:'weekly', remaining_fraction:0.55, reset_time:'3d 12h', cycle_tokens:320000 },
+        ]},
+      ],
+    },
+    live_limited_models: {},
+  },
+  {
+    id: 'acc-007', email: 'grace.worker@qq.com', name: 'Grace', priority: 7,
+    custom_label: '', disabled: false, proxy_disabled: false,
+    created_at: now - 5*24*hour, last_used: now - hour,
+    token: { access_token:'at-007', refresh_token:'rt-007', expires_in:3600, expiry_timestamp: now+hour, token_type:'Bearer', email:'grace.worker@qq.com' },
+    quota: {
+      models: [
+        { name:'claude-sonnet-4-6', percentage:80, reset_time:'2h 15m', display_name:'Claude Sonnet 4', supports_thinking:true },
+        { name:'gemini-3.8-flash-tiered', percentage:70, reset_time:'3h 0m', display_name:'Gemini 3.8 Flash' },
+        { name:'gemini-4-argon', percentage:45, reset_time:'5h 30m', display_name:'Gemini 4 Argon' },
+      ],
+      last_updated: now - 90_000, subscription_tier: 'g1-pro-tier',
+    },
+    live_limited_models: {},
+  },
+  {
+    id: 'acc-008', email: 'henry.test@163.com', name: 'Henry', priority: 8,
+    custom_label: 'Free Tier', disabled: true, proxy_disabled: false,
+    created_at: now - 2*24*hour, last_used: now - 6*hour,
+    token: { access_token:'at-008', refresh_token:'rt-008', expires_in:3600, expiry_timestamp: now+hour, token_type:'Bearer', email:'henry.test@163.com' },
+    quota: {
+      models: [
+        { name:'gemini-3.8-flash-tiered', percentage:100, reset_time:'0m', display_name:'Gemini 3.8 Flash' },
+      ],
+      last_updated: now - 600_000, subscription_tier: 'free-tier',
+    },
+    live_limited_models: {},
+  },];
 
 const MOCK_CONFIG: Record<string,any> = {
   language:'zh', theme:'dark', proxy_port:8045, api_key:'mock-dev-key',
@@ -174,13 +227,13 @@ export function devMockPlugin(): Plugin {
           return json(res, { running:true, port:8045, uptime_seconds:86400, total_requests:1234, active_connections:3, accounts_in_pool:3 });
         if (path === '/api/proxy/pool-status' && req.method === 'GET')
           return json(res, {
-            loaded_count: 5, available_count: 3, locked_account_count: 2, locked_model_count: 3,
+            loaded_count: 8, available_count: 6, locked_account_count: 2, locked_model_count: 4,
             models: [
-              { model:'claude-sonnet-4-6', loaded:4, available:3, locked:1, lock_stats:{ locked:1, true_429:1, fake_429:0, short_locks:0, expires_in_days:[0,1,0,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+7200, latest_until: Math.floor(now/1000)+7200 } },
-              { model:'claude-opus-4-6-thinking', loaded:4, available:3, locked:1, lock_stats:{ locked:1, true_429:1, fake_429:0, short_locks:0, expires_in_days:[0,0,1,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+18000, latest_until: Math.floor(now/1000)+18000 } },
-              { model:'gemini-3.8-flash-tiered', loaded:5, available:5, locked:0 },
-              { model:'gemini-4-argon', loaded:4, available:3, locked:1, lock_stats:{ locked:1, true_429:0, fake_429:1, short_locks:0, expires_in_days:[1,0,0,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+2700, latest_until: Math.floor(now/1000)+2700 } },
-              { model:'gemini-3.1-flash-lite', loaded:3, available:3, locked:0 },
+              { model:'claude-sonnet-4-6', loaded:7, available:6, locked:1, lock_stats:{ locked:1, true_429:1, short_locks:0, expires_in_days:[0,1,0,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+7200, latest_until: Math.floor(now/1000)+7200 } },
+              { model:'claude-opus-4-6-thinking', loaded:7, available:6, locked:1, lock_stats:{ locked:1, true_429:1, short_locks:0, expires_in_days:[0,0,1,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+18000, latest_until: Math.floor(now/1000)+18000 } },
+              { model:'gemini-3.8-flash-tiered', loaded:8, available:8, locked:0 },
+              { model:'gemini-4-argon', loaded:7, available:6, locked:1, lock_stats:{ locked:1, true_429:0, short_locks:1, expires_in_days:[1,0,0,0,0,0], over_six_days:0, earliest_until: Math.floor(now/1000)+2700, latest_until: Math.floor(now/1000)+2700 } },
+              { model:'gemini-3.1-flash-lite', loaded:6, available:6, locked:0 },
             ],
             locked_accounts: [
               { account_id:'acc-002', email:'bob.test@outlook.com', loaded:true, quotas:{}, locks:{ 'claude-sonnet-4-6':{ model:'claude-sonnet-4-6', until: Math.floor(now/1000)+7200, detected_at: Math.floor(now/1000)-1800, status:429, lock_type:'exact', transient_count:0, reason:'Rate limited', message:'Token bucket exhausted' }, 'gemini-4-argon':{ model:'gemini-4-argon', until: Math.floor(now/1000)+2700, detected_at: Math.floor(now/1000)-900, status:503, lock_type:'transient', transient_count:3, reason:'Service unavailable', message:'Backend overloaded' } } },
@@ -197,7 +250,15 @@ export function devMockPlugin(): Plugin {
         // Stats
         if (url.startsWith('/api/stats/')) return json(res, { data:[], summary:{} });
         // Security
-        if (url.startsWith('/api/security/')) return json(res, {});
+        if (url.startsWith('/api/security/')) {
+          if (url.includes('/logs')) return json(res, { logs:[], total:0 });
+          if (url.includes('/stats')) return json(res, { stats:[] });
+          if (url.includes('/blacklist')) return json(res, { ips:[] });
+          if (url.includes('/whitelist')) return json(res, { ips:[] });
+          if (url.includes('/token-stats')) return json(res, { stats:[] });
+          if (url.includes('/config')) return json(res, { enabled:false, max_requests_per_minute:60, block_duration_seconds:3600 });
+          return json(res, {});
+        }
         // Logs
         if (url.startsWith('/api/logs')) {
           if (url.includes('/count')) return json(res, { count:0 });
@@ -215,7 +276,7 @@ export function devMockPlugin(): Plugin {
         // User tokens
         if (url.startsWith('/api/user-tokens')) {
           if (url.includes('/summary')) return json(res, { total:0, active:0 });
-          return json(res, { tokens:[] });
+          return json(res, []);
         }
         // Debug
         if (url.startsWith('/api/debug/')) {

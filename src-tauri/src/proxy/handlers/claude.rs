@@ -927,6 +927,31 @@ pub async fn handle_messages(
             }
         };
 
+    // [思考] prefix policy: strip prefix before any mapping/routing/account selection.
+    let requested_model = request.model.clone();
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model,
+        );
+    let requested_thinking_budget = extract_thinking_hint(&original_body)
+        .budget_tokens
+        .map(u64::from);
+    request.model = thought_policy.routing_model(&requested_model).to_string();
+    if thought_policy
+        != crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        request.thinking = Some(crate::proxy::mappers::claude::models::ThinkingConfig {
+            type_: "enabled".to_string(),
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            effort: None,
+        });
+        request.output_config = None;
+    }
+
     // 0. 自定义映射优先拦截 (用户自定义路由与热更新规则拥有最高优先级，避免被后续变体推断抹平原模型意图)
     let custom_target = {
         let custom_mapping = state.custom_mapping.read().await;
@@ -953,7 +978,20 @@ pub async fn handle_messages(
         || model_lower.ends_with("-low")
         || model_lower.ends_with("-extra-low");
 
-    let thinking_hint = extract_thinking_hint(&original_body);
+    let thinking_hint = if thought_policy
+        == crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::Unspecified
+    {
+        extract_thinking_hint(&original_body)
+    } else {
+        ThinkingHint {
+            budget_tokens: Some(
+                crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::positive_budget(
+                    requested_thinking_budget,
+                ),
+            ),
+            level: None,
+        }
+    };
     let tb_config = crate::proxy::config::get_thinking_budget_config();
     let is_client_control =
         tb_config.control_source == crate::proxy::config::ThinkingControlSource::Client;
@@ -1901,6 +1939,7 @@ pub async fn handle_messages(
             "anthropic",
         );
         crate::proxy::mappers::common_utils::ensure_gemini_payload_ends_with_user(&mut gemini_body);
+        thought_policy.apply_upstream(&mut gemini_body, requested_thinking_budget);
 
         let norm_total_micros = norm_start.elapsed().as_micros() as u64;
         let tf_micros = transform_timing.think_fill_micros;
@@ -2118,6 +2157,7 @@ pub async fn handle_messages(
                     current_message_count, // [NEW v4.0.0] Pass message count for rewind detection
                     client_adapter.clone(), // [NEW] Pass client adapter
                     registered_tool_names, // [FIX #MCP] Pass tool names for fuzzy matching
+                    thought_policy.shows_thoughts(), // [思考] Control thinking visibility
                 );
 
                 // [FIX #3634 对齐 Anthropic 官方规范并彻底杜绝网关静默超时]

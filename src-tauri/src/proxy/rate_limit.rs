@@ -955,29 +955,8 @@ impl RateLimitTracker {
         self.limits.len() != before
     }
 
-    pub fn clear_for_optimistic_reset(&self) {
-        let now = SystemTime::now();
-        self.limits.retain(|_, info| {
-            // 乐观重置旨在清除瞬态流控与并发限制 (RateLimitExceeded / Concurrency)。
-            // 对于明确的配额耗尽 (QuotaExhausted)，无论其重置周期长短，只要 reset_time 仍在将来，
-            // 绝不可被乐观重置误清，防止将已知 0 配额的账号重新放行回流。
-            info.reason == RateLimitReason::QuotaExhausted
-                && info.reset_time.duration_since(now).is_ok()
-        });
-    }
 
-    /// 清除所有限流记录 (乐观重置策略)
-    ///
-    /// 用于乐观重置机制,当所有账号都被限流但等待时间很短时,
-    /// 清除所有限流记录以解决时序竞争条件
-    pub fn clear_all(&self) {
-        let count = self.limits.len();
-        self.limits.clear();
-        tracing::warn!(
-            "🔄 Optimistic reset: Cleared all {} rate limit record(s)",
-            count
-        );
-    }
+
 }
 
 impl Default for RateLimitTracker {
@@ -1065,7 +1044,6 @@ mod tests {
             .unwrap();
         assert_eq!(info.retry_after_sec, 210_293);
 
-        tracker.clear_for_optimistic_reset();
         assert!(tracker.is_rate_limited("acc-long", Some("gemini-3-pro-image")));
 
         let now = SystemTime::now();
@@ -1075,7 +1053,6 @@ mod tests {
             now - Duration::from_secs(301),
             "gemini-3.1-flash-image",
         ));
-        tracker.clear_for_optimistic_reset();
         assert!(tracker.is_rate_limited("acc-expiring", Some("gemini-3.1-flash-image")));
 
         let inferred = tracker
@@ -1126,42 +1103,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_clear_for_optimistic_reset_preserves_capped_and_uncapped_quota_exhausted() {
-        let tracker = RateLimitTracker::new();
-        let now = SystemTime::now();
 
-        // 1. QuotaExhausted with capped 300s duration (reset_time in future)
-        tracker.limits.insert(
-            "acc-quota-capped:gemini-3-flash".to_string(),
-            RateLimitInfo {
-                reset_time: now + Duration::from_secs(250),
-                retry_after_sec: 250,
-                detected_at: now - Duration::from_secs(50),
-                reason: RateLimitReason::QuotaExhausted,
-                model: Some("gemini-3-flash".to_string()),
-            },
-        );
-
-        // 2. Transient RateLimitExceeded (concurrency delay)
-        tracker.limits.insert(
-            "acc-transient:gemini-3-flash".to_string(),
-            RateLimitInfo {
-                reset_time: now + Duration::from_secs(5),
-                retry_after_sec: 5,
-                detected_at: now,
-                reason: RateLimitReason::RateLimitExceeded,
-                model: Some("gemini-3-flash".to_string()),
-            },
-        );
-
-        tracker.clear_for_optimistic_reset();
-
-        // QuotaExhausted MUST be preserved to prevent routing to dead accounts
-        assert!(tracker.is_rate_limited("acc-quota-capped", Some("gemini-3-flash")));
-        // Transient RateLimitExceeded MUST be cleared to relieve concurrency blocks
-        assert!(!tracker.is_rate_limited("acc-transient", Some("gemini-3-flash")));
-    }
 
     #[test]
     fn task_claude_baseline_ignores_retry_info_delay() {
@@ -1236,7 +1178,6 @@ mod tests {
         assert_eq!(info3.retry_after_sec, 30, "三次遭遇瞬态流控上限锁定 30s");
 
         // 乐观重置策略必须能够清除非硬配额的 RateLimitExceeded
-        tracker.clear_for_optimistic_reset();
         assert!(
             !tracker.is_rate_limited("acc-tpm", None),
             "乐观重置必须清空瞬态流控锁定，防止误杀全池"

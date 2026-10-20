@@ -16,13 +16,10 @@ pub const INDEPENDENT_MODELS: [&str; 5] = [
     "claude-sonnet-4-6",
     "claude-opus-4-6-thinking",
     "gemini-3.8-flash-tiered",
-    "gemini-4-argon",
     "gemini-3.1-flash-lite",
+    "gemini-4-argon",
 ];
 
-/// Canonical key used only for the strict lock ledger and its UI.
-/// Keep this separate from the physical upstream model id and from the
-/// official available-model capability catalog.
 pub fn model_key(model: &str) -> String {
     let model = model.trim().to_ascii_lowercase();
     let model = model.strip_prefix("models/").unwrap_or(&model);
@@ -38,7 +35,9 @@ pub fn model_key(model: &str) -> String {
 }
 
 const CLAUDE_POOL: &str = "claude";
+
 const CLAUDE_MODELS: [&str; 2] = ["claude-sonnet-4-6", "claude-opus-4-6-thinking"];
+
 
 fn quota_pool(model: &str) -> Option<&'static str> {
     if model == "claude" || CLAUDE_MODELS.contains(&model) {
@@ -205,7 +204,6 @@ pub struct ModelLock {
 pub struct ModelLockStatistics {
     pub locked: usize,
     pub true_429: usize,
-    pub fake_429: usize,
     pub short_locks: usize,
     // Index 0 is (0, 1d], index 5 is (5d, 6d]. No deadline is rounded or changed.
     pub expires_in_days: [usize; 6],
@@ -223,8 +221,6 @@ impl ModelLockStatistics {
         self.locked += 1;
         if lock.status == 429 && lock.lock_type == "exact" {
             self.true_429 += 1;
-        } else if lock.status == 503 {
-            self.fake_429 += 1;
         } else {
             self.short_locks += 1;
         }
@@ -415,14 +411,7 @@ impl AccountLocks {
                 .unwrap_or(0);
             models.insert("claude".into(), value);
         }
-        for prefix in ["gemini-3.6-flash", "gemini-3.7-flash", "gemini-3.8-flash"] {
-            if let Some(value) = models.get(&format!("{prefix}-tiered")) {
-                let mut value = value.clone();
-                value.model = format!("{prefix}-high");
-                models.insert(value.model.clone(), value);
-            }
-        }
-        models
+            models
     }
 }
 
@@ -820,7 +809,7 @@ impl ModelLocks {
                             detected_at: now,
                             lock_type: "exact".into(),
                             transient_count: 0,
-                            message: body.chars().take(600).collect(),
+                            message: body.chars().take(200).collect(),
                         },
                     );
                     self.persist(&account);
@@ -879,7 +868,7 @@ impl ModelLocks {
             }
             .into(),
             transient_count: count,
-            message: body.chars().take(600).collect(),
+            message: body.chars().take(200).collect(),
         };
         account.models.insert(key, value.clone());
         self.persist(&account);
@@ -1012,84 +1001,83 @@ mod tests {
     use super::*;
 
     #[test]
-    fn canonical_keys_cover_claude_aliases_only() {
+    fn model_key_claude_aliases() {
         assert_eq!(model_key("claude-opus-4-6"), "claude-opus-4-6-thinking");
-        assert_eq!(
-            model_key("[思考]claude-opus-4-6"),
-            "claude-opus-4-6-thinking"
-        );
-        // gemini-4-argon only represents itself, no wildcard mapping
-        assert_eq!(model_key("gemini-4-argon"), "gemini-4-argon");
-        assert_eq!(model_key("gemini-4-argon-low"), "gemini-4-argon-low");
-        assert_eq!(model_key("gemini-4"), "gemini-4");
-        // gemini-3.8-flash-tiered only represents itself
+        assert_eq!(model_key("[思考]claude-opus-4-6"), "claude-opus-4-6-thinking");
+        assert_eq!(model_key("claude-sonnet-4-6-thinking"), "claude-sonnet-4-6");
+        assert_eq!(model_key("claude-sonnet-4-6"), "claude-sonnet-4-6");
+    }
+
+    #[test]
+    fn model_key_no_normalization() {
+        // No flash normalization - each model is its own key
         assert_eq!(model_key("gemini-3.8-flash-tiered"), "gemini-3.8-flash-tiered");
         assert_eq!(model_key("gemini-3.8-flash-high"), "gemini-3.8-flash-high");
-        assert_eq!(model_key("gemini-3.6-flash-tiered"), "gemini-3.6-flash-tiered");
+        assert_eq!(model_key("gemini-4-argon"), "gemini-4-argon");
+        assert_eq!(model_key("gemini-4-argon-low"), "gemini-4-argon-low");
         assert_eq!(model_key("gemini-3.1-flash-lite"), "gemini-3.1-flash-lite");
     }
 
     #[test]
-    fn only_claude_true_429_is_shared() {
+    fn claude_true_429_shared_pool() {
         let store = ModelLocks::default();
         let now = 10_000;
-        store.record(
-            "a",
-            "claude-opus-4-6-thinking",
-            429,
-            "QUOTA_EXHAUSTED",
-            Some(now + 3600),
-            true,
-            now,
-        );
+        store.record("a", "claude-opus-4-6-thinking", 429, "quota", Some(now + 3600), true, now);
+        // Claude pool: true 429 on opus affects sonnet
         assert_eq!(store.wait("a", "claude-sonnet-4-6", now), 3600);
+        assert_eq!(store.wait("a", "claude-opus-4-6", now), 3600);
+        // 503 does NOT share across Claude pool
         store.record("a", "claude-sonnet-4-6", 503, "busy", None, false, now);
+        // opus still sees the pool lock, not the 503
         assert_eq!(store.wait("a", "claude-opus-4-6-thinking", now), 3600);
     }
 
     #[test]
-    fn gemini_models_have_independent_locks() {
+    fn gemini_models_fully_independent() {
         let store = ModelLocks::default();
         let now = 10_000;
-        // gemini-4-argon lock does NOT affect other gemini-4 variants
-        store.record(
-            "a",
-            "gemini-4-argon",
-            429,
-            "QUOTA_EXHAUSTED",
-            Some(now + 600),
-            true,
-            now,
-        );
+        store.record("a", "gemini-4-argon", 429, "quota", Some(now + 600), true, now);
         assert_eq!(store.wait("a", "gemini-4-argon", now), 600);
-        assert_eq!(store.wait("a", "gemini-4-argon-low", now), 0);
-        assert_eq!(store.wait("a", "gemini-4", now), 0);
-        assert_eq!(store.wait("a", "gemini-3.1-flash-lite", now), 0);
+        // Other gemini models unaffected
         assert_eq!(store.wait("a", "gemini-3.8-flash-tiered", now), 0);
+        assert_eq!(store.wait("a", "gemini-3.1-flash-lite", now), 0);
     }
 
     #[test]
-    fn strict_locks_survive_restart_and_expire_only_by_time() {
+    fn short_lock_escalation() {
+        let store = ModelLocks::default();
+        let mut now = 1000;
+        for n in 1..=8 {
+            let lock = store.record("a", "gemini-3.8-flash-tiered", 503, "busy", None, false, now).unwrap();
+            assert_eq!(lock.transient_count, n);
+            assert_eq!(lock.until - now, if n <= 6 { 600 } else { 1800 });
+            now = lock.until;
+        }
+    }
+
+    #[test]
+    fn locks_persist_and_survive_restart() {
         let dir = tempfile::tempdir().unwrap();
         let now = chrono::Utc::now().timestamp();
         {
             let store = ModelLocks::open(dir.path().to_path_buf());
-            store.bind_identity("uuid-1", "user@example.com");
-            store.record(
-                "uuid-1",
-                "gemini-4-argon",
-                503,
-                "busy",
-                Some(now + 600),
-                false,
-                now,
-            );
-            assert!(store.wait("uuid-1", "gemini-4-argon", now) > 0);
+            store.record("a", "claude-opus-4-6-thinking", 429, "quota", Some(now + 7200), true, now);
+            store.record("a", "gemini-4-argon", 503, "busy", None, false, now);
         }
-        let restored = ModelLocks::open(dir.path().to_path_buf());
-        assert!(restored.wait("uuid-1", "gemini-4-argon", now) > 0);
-        // other gemini-4 variants are NOT affected
-        assert_eq!(restored.wait("uuid-1", "gemini-4-argon-low", now), 0);
-        assert_eq!(restored.wait("uuid-1", "gemini-4-argon", now + 601), 0);
+        let store = ModelLocks::open(dir.path().to_path_buf());
+        assert!(store.wait("a", "claude-opus-4-6", now) > 0);
+        assert!(store.wait("a", "claude-sonnet-4-6", now) > 0); // Claude pool
+        assert!(store.wait("a", "gemini-4-argon", now) > 0);
+        assert_eq!(store.wait("a", "gemini-3.8-flash-tiered", now), 0); // Independent
+    }
+
+    #[test]
+    fn only_429_and_503_create_locks() {
+        let store = ModelLocks::default();
+        let now = 10_000;
+        assert!(store.record("a", "gemini-4-argon", 529, "busy", None, false, now).is_none());
+        assert!(store.record("a", "gemini-4-argon", 400, "bad", None, false, now).is_none());
+        assert!(store.record("a", "gemini-4-argon", 429, "limit", None, false, now).is_some());
+        assert!(store.record("b", "gemini-4-argon", 503, "busy", None, false, now).is_some());
     }
 }

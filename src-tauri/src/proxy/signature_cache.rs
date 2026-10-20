@@ -3,13 +3,13 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
 
 // Node.js proxy uses 2 hours TTL
-const SIGNATURE_TTL: Duration = Duration::from_secs(2 * 60 * 60);
+const SIGNATURE_TTL: Duration = Duration::from_secs(60 * 60);
 const MIN_SIGNATURE_LENGTH: usize = 32;
 
 // Different cache limits for different layers
-const TOOL_CACHE_LIMIT: usize = 500; // Layer 1: Tool-specific signatures
-const FAMILY_CACHE_LIMIT: usize = 200; // Layer 2: Model family mappings
-const SESSION_CACHE_LIMIT: usize = 1000; // Layer 3: Session-based signatures (largest)
+const TOOL_CACHE_LIMIT: usize = 200; // Layer 1: Tool-specific signatures
+const FAMILY_CACHE_LIMIT: usize = 100; // Layer 2: Model family mappings
+const SESSION_CACHE_LIMIT: usize = 300; // Layer 3: Session-based signatures (largest)
 
 /// Cache entry with timestamp for TTL
 #[derive(Clone, Debug)]

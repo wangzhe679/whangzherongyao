@@ -14,7 +14,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 const CACHE_TTL: Duration = Duration::from_secs(3600); // 1 小时缓存
-const MAX_CACHE_ENTRIES: usize = 5000;
+const MAX_CACHE_ENTRIES: usize = 2000;
 
 #[derive(Clone, Debug)]
 struct CacheEntry {

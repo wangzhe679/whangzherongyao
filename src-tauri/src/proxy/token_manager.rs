@@ -3242,104 +3242,12 @@ impl TokenManager {
                                 );
                                 t.clone()
                             } else {
-                                // Layer 2: 缓冲后仍无可用账号,执行乐观重置
-                                tracing::warn!(
-                                    "Buffer delay failed. Executing optimistic reset for all {} accounts...",
-                                    tokens_snapshot.len()
+                                return Err(
+                                    "All accounts rate-limited. Waiting for lock expiry.".to_string()
                                 );
-
-                                // 清除所有限流记录
-                                self.rate_limit_tracker.clear_for_optimistic_reset();
-
-                                // 再次尝试选择账号 (优先选用未限流且对目标模型具备正配额的账号，严禁直接放行 0% 额度账号)
-                                let final_token = tokens_snapshot
-                                    .iter()
-                                    .find(|t| {
-                                        !attempted.contains(&t.account_id)
-                                            && !self.rate_limit_tracker.is_rate_limited(
-                                                &t.account_id,
-                                                Some(&normalized_target),
-                                            )
-                                            && !(quota_protection_enabled
-                                                && t.protected_models.contains(&normalized_target))
-                                            && t.model_quotas
-                                                .get(&normalized_target)
-                                                .copied()
-                                                .unwrap_or(0)
-                                                > 0
-                                    })
-                                    .or_else(|| {
-                                        tokens_snapshot.iter().find(|t| {
-                                            !attempted.contains(&t.account_id)
-                                                && !self.rate_limit_tracker.is_rate_limited(
-                                                    &t.account_id,
-                                                    Some(&normalized_target),
-                                                )
-                                                && !(quota_protection_enabled
-                                                    && t.protected_models
-                                                        .contains(&normalized_target))
-                                        })
-                                    });
-
-                                if let Some(t) = final_token {
-                                    tracing::info!(
-                                        "✅ Optimistic reset successful! Using account: {}",
-                                        t.email
-                                    );
-                                    t.clone()
-                                } else {
-                                    return Err(
-                                        "All accounts failed after optimistic reset.".to_string()
-                                    );
-                                }
                             }
                         } else {
-                            // [FIX #3506] 当最小等待时间 > 2s 时，不进行阻塞式 sleep 缓冲（避免客户端请求超时）。
-                            // 但若全池仅被瞬态速率限制（RateLimitExceeded）锁定而无周配额耗尽硬伤时，
-                            // 立即执行 Layer 2 乐观重置清除瞬态流控标记，严禁直接返回 503 导致整池雪崩瘫痪。
-                            tracing::warn!(
-                                "All accounts limited with wait {}s > 2s. Attempting optimistic reset for transient rate limits...",
-                                wait_sec
-                            );
-                            self.rate_limit_tracker.clear_for_optimistic_reset();
-                            let final_token = tokens_snapshot
-                                .iter()
-                                .find(|t| {
-                                    !attempted.contains(&t.account_id)
-                                        && !self.rate_limit_tracker.is_rate_limited(
-                                            &t.account_id,
-                                            Some(&normalized_target),
-                                        )
-                                        && !(quota_protection_enabled
-                                            && t.protected_models.contains(&normalized_target))
-                                        && t.model_quotas
-                                            .get(&normalized_target)
-                                            .copied()
-                                            .unwrap_or(0)
-                                            > 0
-                                })
-                                .or_else(|| {
-                                    tokens_snapshot.iter().find(|t| {
-                                        !attempted.contains(&t.account_id)
-                                            && !self.rate_limit_tracker.is_rate_limited(
-                                                &t.account_id,
-                                                Some(&normalized_target),
-                                            )
-                                            && !(quota_protection_enabled
-                                                && t.protected_models.contains(&normalized_target))
-                                    })
-                                });
-
-                            if let Some(t) = final_token {
-                                tracing::info!(
-                                    "✅ Optimistic reset successful for wait {}s! Rescued available account: {}",
-                                    wait_sec,
-                                    t.email
-                                );
-                                t.clone()
-                            } else {
-                                return Err(format!("All accounts limited. Wait {}s.", wait_sec));
-                            }
+                            return Err(format!("All accounts limited. Shortest wait {}s. No optimistic reset.", wait_sec));
                         }
                     } else {
                         return Err("All accounts failed or unhealthy.".to_string());
@@ -3748,7 +3656,8 @@ impl TokenManager {
 
     /// 清除所有限流记录
     pub fn clear_all_rate_limits(&self) {
-        self.rate_limit_tracker.clear_all();
+        // Optimistic reset removed: only clear persisted live_limited_models from account files.
+        // model_locks (strict) and rate_limit_tracker limits are NOT cleared.
         let accounts_dir = self.resolved_data_dir().join("accounts");
         if let Ok(entries) = std::fs::read_dir(accounts_dir) {
             for entry in entries.flatten() {
@@ -5379,7 +5288,6 @@ mod tests {
         manager.circuit_breaker_config.write().await.enabled = false;
         manager.reload_account("weekly-test").await.unwrap();
         manager.load_accounts().await.unwrap();
-        manager.rate_limit_tracker.clear_for_optimistic_reset();
         manager.clear_all_rate_limits();
         assert!(
             manager
@@ -7312,81 +7220,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_optimistic_reset_rescues_all_accounts_transiently_rate_limited() {
-        let temp_dir = tempfile::tempdir().unwrap();
-        let manager = TokenManager::new(temp_dir.path().to_path_buf());
 
-        let mut quotas = HashMap::new();
-        quotas.insert("gemini-3-pro-high".to_string(), 100);
-        let mut limits = HashMap::new();
-        limits.insert("gemini-3-pro-high".to_string(), 64000);
-
-        let token1 = ProxyToken {
-            account_id: "acc_transient_1".to_string(),
-            access_token: "token1".to_string(),
-            refresh_token: "refresh1".to_string(),
-            expires_in: 3600,
-            timestamp: chrono::Utc::now().timestamp() + 3600,
-            email: "acc1@example.com".to_string(),
-            account_path: temp_dir.path().join("acc1.json"),
-            project_id: None,
-            subscription_tier: Some("PRO".to_string()),
-            remaining_quota: Some(100),
-            priority: 0,
-            protected_models: HashSet::new(),
-            health_score: 1.0,
-            reset_time: None,
-            weekly_reset_time: None,
-            validation_blocked: false,
-            validation_blocked_until: 0,
-            validation_url: None,
-            model_quotas: quotas,
-            model_limits: limits,
-            available_models: HashSet::new(),
-        };
-
-        std::fs::write(
-            &token1.account_path,
-            serde_json::json!({"disabled": false}).to_string(),
-        )
-        .unwrap();
-
-        manager.tokens.insert(token1.account_id.clone(), token1);
-
-        // 模拟遭遇单次 429 导致账号被锁定 5 秒 (wait_sec = 5 > 2s)
-        manager.rate_limit_tracker.parse_from_error(
-            "acc_transient_1",
-            429,
-            None,
-            r#"{"error":{"code":429,"message":"Resource has been exhausted (e.g. check quota)."}}"#,
-            Some("gemini-3-pro-high".to_string()),
-            &[60, 300],
-        );
-
-        assert!(manager
-            .rate_limit_tracker
-            .is_rate_limited("acc_transient_1", Some("gemini-3-pro-high")));
-        let wait = manager
-            .rate_limit_tracker
-            .get_remaining_wait("acc_transient_1", Some("gemini-3-pro-high"));
-        assert!(
-            wait > 2,
-            "Wait must be > 2s to test Layer 2 optimistic reset trigger"
-        );
-
-        // [Issue #3506 核心断言] 发起新请求时，TokenManager 检测到全池受限但仅为瞬态 RateLimitExceeded，
-        // 必须成功触发乐观重置并解救账号，严禁直接抛出 503 "All accounts limited"
-        let res = manager
-            .get_token("gemini", false, None, "gemini-3.1-pro-high")
-            .await;
-        assert!(
-            res.is_ok(),
-            "Optimistic reset must rescue transiently rate limited account instead of returning 503 error"
-        );
-        let (token_str, _, _, _, _) = res.unwrap();
-        assert_eq!(token_str, "token1");
-    }
 
     #[tokio::test]
     async fn test_mark_account_success_resolves_email_and_resets_tracker() {

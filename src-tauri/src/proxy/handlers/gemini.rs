@@ -191,6 +191,11 @@ pub async fn handle_generate(
         .and_then(|tc| tc.get("thinkingLevel").or_else(|| tc.get("effort")))
         .and_then(|v| v.as_str());
 
+    // [思考] Strip prefix before model resolution
+    let thought_policy_gemini =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(&model_name);
+    let model_name = thought_policy_gemini.routing_model(&model_name).to_string();
+
     let initial_mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
         &model_name,
         &*state.custom_mapping.read().await,

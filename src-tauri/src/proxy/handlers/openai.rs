@@ -2088,6 +2088,14 @@ pub async fn handle_chat_completions(
     let mut used_attempts = 0;
     let mut retried_without_thinking = false;
 
+    // [思考] Strip prefix before any model resolution
+    let requested_model_openai = openai_req.model.clone();
+    let thought_policy =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model_openai,
+        );
+    openai_req.model = thought_policy.routing_model(&requested_model_openai).to_string();
+
     // 2. 模型路由解析 (移到循环外以支持在所有路径返回 X-Mapped-Model)
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
         &openai_req.model,
@@ -3906,6 +3914,14 @@ pub async fn handle_completions(
                 .as_ref()
                 .and_then(|t| t.effort.as_deref())
         });
+
+    // [思考] Strip prefix before any model resolution (responses handler)
+    let requested_model_resp = openai_req.model.clone();
+    let thought_policy_resp =
+        crate::proxy::pipeline::thinking_policy::RequestedThinkingPolicy::from_model(
+            &requested_model_resp,
+        );
+    openai_req.model = thought_policy_resp.routing_model(&requested_model_resp).to_string();
 
     let mapped_model = crate::proxy::common::model_mapping::resolve_model_route_with_effort(
         &openai_req.model,

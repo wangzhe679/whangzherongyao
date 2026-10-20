@@ -126,6 +126,7 @@ pub fn create_claude_sse_stream<S, E>(
     message_count: usize,                 // [NEW v4.0.0] Message count for rewind detection
     client_adapter: Option<std::sync::Arc<dyn ClientAdapter>>, // [NEW] Adapter reference
     registered_tool_names: Vec<String>,   // [FIX #MCP] Tool names for fuzzy matching
+    show_thoughts: bool,                    // [思考] Whether to emit thinking blocks to client
 ) -> Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>
 where
     S: Stream<Item = Result<Bytes, E>> + Send + ?Sized + 'static,
@@ -139,6 +140,7 @@ where
     state.estimated_prompt_tokens = estimated_prompt_tokens;
     state.set_client_adapter(client_adapter);
     state.set_registered_tool_names(registered_tool_names);
+    state.show_thoughts = show_thoughts;
 
     let session_str = state.session_id.clone().unwrap_or_else(|| "-".to_string());
     let trace_info = format!(

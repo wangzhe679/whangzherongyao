@@ -837,6 +837,8 @@ impl AxumServer {
             .route("/proxy/status", get(admin_get_proxy_status))
             .route("/proxy/pool/config", get(admin_get_proxy_pool_config))
             .route("/proxy/pool/bindings", get(admin_get_all_account_bindings))
+            .route("/proxy/pool-status", get(admin_get_pool_status))
+            .route("/proxy/export-delete-forbidden", post(admin_export_delete_forbidden))
             .route("/proxy/pool/bind", post(admin_bind_account_proxy))
             .route("/proxy/pool/unbind", post(admin_unbind_account_proxy))
             .route(
@@ -1912,6 +1914,90 @@ async fn admin_get_proxy_pool_config(
 ) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
     let config = state.proxy_pool_state.read().await;
     Ok(Json(config.clone()))
+}
+
+// [FIX Web Mode] Pool status for independent model locks
+async fn admin_get_pool_status(
+    State(state): State<AppState>,
+    Query(params): Query<std::collections::HashMap<String, String>>,
+) -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let manager = state.token_manager.clone();
+    let page: usize = params.get("page").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let include_details: bool = params
+        .get("includeDetails")
+        .map(|v| v == "true" || v == "1")
+        .unwrap_or(true);
+    let result = tokio::task::spawn_blocking(move || {
+        manager.cleanup_strict_sessions();
+        let mut value = if include_details {
+            manager.strict_pool_status(page)
+        } else {
+            manager.strict_pool_status_summary()
+        };
+        value["runtime"] = crate::proxy::runtime_limits::LIMITS.info();
+        value
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
+    Ok(Json(result))
+}
+
+// [FIX Web Mode] Export and delete 403 forbidden accounts
+async fn admin_export_delete_forbidden() -> Result<impl IntoResponse, (StatusCode, Json<ErrorResponse>)> {
+    let result = tokio::task::spawn_blocking(|| {
+        let accounts = crate::modules::account::list_accounts().map_err(|e| e.to_string())?;
+        let forbidden: Vec<_> = accounts
+            .into_iter()
+            .filter(|account| {
+                account
+                    .quota
+                    .as_ref()
+                    .is_some_and(|quota| quota.is_forbidden)
+            })
+            .collect();
+        let exported: Vec<_> = forbidden
+            .iter()
+            .map(|account| {
+                serde_json::json!({
+                    "id": account.id,
+                    "name": account.name,
+                    "email": account.email,
+                    "refresh_token": account.token.refresh_token,
+                })
+            })
+            .collect();
+        let ids: Vec<String> = forbidden.into_iter().map(|account| account.id).collect();
+        if !ids.is_empty() {
+            crate::modules::account::delete_accounts(&ids).map_err(|e| e.to_string())?;
+        }
+        Ok::<_, String>(serde_json::json!({
+            "accounts": exported,
+            "deleted": ids.len(),
+        }))
+    })
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?
+    .map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: e }),
+        )
+    })?;
+    Ok(Json(result))
 }
 
 // [FIX Web Mode] Get all account proxy bindings

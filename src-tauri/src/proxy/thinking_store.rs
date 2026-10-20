@@ -21,11 +21,11 @@ use std::time::{Duration, Instant};
 
 const MIN_SIGNATURE_LENGTH: usize = 32;
 pub const SENTINEL_SIGNATURE: &str = "skip_thought_signature_validator";
-const MAX_SESSIONS: usize = 500;
+const MAX_SESSIONS: usize = 200;
 fn max_turns_per_session() -> usize {
     crate::proxy::config::get_thinking_max_memory_turns()
 }
-const MAX_BYTES_PER_SESSION: usize = 4 * 1024 * 1024;
+const MAX_BYTES_PER_SESSION: usize = 2 * 1024 * 1024;
 /// Persist last_accessed at most this often. Fill/hydrate is memory-only between writes.
 const TOUCH_PERSIST_INTERVAL: Duration = Duration::from_secs(5 * 60);
 

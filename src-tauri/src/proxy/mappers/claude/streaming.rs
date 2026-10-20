@@ -97,6 +97,8 @@ pub struct StreamingState {
     pub thinking_acc: crate::proxy::thinking_store::TurnAccumulator,
     /// 缓存流式过程中接收到的最近一次使用量元数据，防止单独下发 finishReason 或无元数据收尾时 Token 统计归零
     pub last_usage: Option<UsageMetadata>,
+    /// [思考] Whether to emit thinking blocks to the client (false = hidden, true = visible)
+    pub show_thoughts: bool,
 }
 
 impl StreamingState {
@@ -129,6 +131,7 @@ impl StreamingState {
             text_delta_emitted_this_turn: false,
             thinking_acc: crate::proxy::thinking_store::TurnAccumulator::new(),
             last_usage: None,
+            show_thoughts: true,
         }
     }
 
@@ -472,7 +475,9 @@ impl StreamingState {
 
     /// 设置 trailing signature
     pub fn set_trailing_signature(&mut self, signature: Option<String>) {
-        self.trailing_signature = signature;
+        if self.show_thoughts {
+            self.trailing_signature = signature;
+        }
     }
 
     /// 获取 trailing signature (仅用于检查)
@@ -635,6 +640,20 @@ impl<'a> PartProcessor<'a> {
     /// 处理 Thinking
     fn process_thinking(&mut self, text: &str, signature: Option<String>) -> Vec<Bytes> {
         let mut chunks = Vec::new();
+        if !self.state.show_thoughts {
+            // The stream's TurnAccumulator has already captured this part.
+            // Cache the real signature without opening any client thinking block.
+            if let Some(sig) = signature {
+                if let Some(model) = &self.state.model_name {
+                    SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
+                }
+                if let Some(session_id) = &self.state.session_id {
+                    SignatureCache::global().cache_session_signature(session_id, sig);
+                }
+            }
+            self.state.has_thinking = true;
+            return chunks;
+        }
 
         // 处理之前的 trailingSignature
         if self.state.has_trailing_signature() {
