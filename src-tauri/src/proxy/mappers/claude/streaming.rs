@@ -648,7 +648,7 @@ impl<'a> PartProcessor<'a> {
                     SignatureCache::global().cache_thinking_family(sig.clone(), model.clone());
                 }
                 if let Some(session_id) = &self.state.session_id {
-                    SignatureCache::global().cache_session_signature(session_id, sig);
+                    SignatureCache::global().cache_session_signature(session_id, sig, self.state.message_count);
                 }
             }
             self.state.has_thinking = true;

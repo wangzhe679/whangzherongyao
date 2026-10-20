@@ -543,6 +543,7 @@ mod tests {
             1,          // message_count
             None,       // client_adapter
             Vec::new(), // registered_tool_names
+            true,        // show_thoughts
         );
 
         // 3. 收集输出
@@ -607,6 +608,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -685,6 +687,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -761,6 +764,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -830,6 +834,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -911,6 +916,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -988,6 +994,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -1048,6 +1055,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -1135,6 +1143,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut errors = Vec::new();
@@ -1188,6 +1197,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut all_chunks = Vec::new();
@@ -1255,6 +1265,7 @@ mod tests {
             1,
             None,
             Vec::new(),
+            true, // show_thoughts
         );
 
         let mut first_chunk = None;
